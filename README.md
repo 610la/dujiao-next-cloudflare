@@ -6,6 +6,8 @@
 
 基于 Dujiao Next 的 Cloudflare 原生适配版本。项目保留原有 Vue 前台与管理后台，并将后端能力迁移到 Cloudflare Workers、D1 和 KV，无需单独购买 VPS。
 
+原版项目仓库：[dujiao-next/dujiao-next](https://github.com/dujiao-next/dujiao-next)
+
 ### 功能
 
 - 商品分类、多规格 SKU、上下架与多语言内容
@@ -50,6 +52,8 @@ pnpm run build
 ## English
 
 A Cloudflare-native port of Dujiao Next. It keeps the original Vue storefront and admin application while moving backend services to Cloudflare Workers, D1, and KV, so no separate VPS is required.
+
+Upstream repository: [dujiao-next/dujiao-next](https://github.com/dujiao-next/dujiao-next)
 
 ### Features
 

@@ -1,0 +1,549 @@
+<script setup lang="ts">
+import { computed, onMounted, ref, watch } from 'vue'
+import { RouterLink } from 'vue-router'
+import { useI18n } from 'vue-i18n'
+import { useDebounceFn } from '@vueuse/core'
+import { Download, PackageCheck, Upload } from 'lucide-vue-next'
+import { adminAPI } from '@/api/admin'
+import type { AdminCardSecretBatch, AdminProduct, AdminProductSKU } from '@/api/types'
+import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { getLocalizedText } from '@/utils/format'
+import { adminHref } from '@/utils/adminHref'
+
+const { t } = useI18n()
+
+const productKeyword = ref('')
+const productOptions = ref<AdminProduct[]>([])
+const productOptionsLoading = ref(false)
+const selectedProductValue = ref('__all__')
+const productInfo = ref<AdminProduct | null>(null)
+const skuFilterValue = ref('__all__')
+const batchFilterValue = ref('__all__')
+const batches = ref<AdminCardSecretBatch[]>([])
+const batchesLoading = ref(false)
+const availableCount = ref(0)
+const exportCount = ref(1)
+const exportFormat = ref<'txt' | 'csv'>('txt')
+const deleteAfterExport = ref(false)
+const exporting = ref(false)
+const successMessage = ref('')
+const errorMessage = ref('')
+
+const normalizeFilterValue = (value: string) => (value === '__all__' ? '' : value)
+
+const parsePositiveInteger = (value: unknown) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0
+  return Math.floor(parsed)
+}
+
+const parseProductId = () => parsePositiveInteger(normalizeFilterValue(selectedProductValue.value)) || null
+const parseSkuId = () => parsePositiveInteger(normalizeFilterValue(skuFilterValue.value))
+const parseBatchId = () => parsePositiveInteger(normalizeFilterValue(batchFilterValue.value))
+
+const formatSkuSpecValues = (specValues: Record<string, string> | null | undefined) => {
+  if (!specValues || typeof specValues !== 'object' || Array.isArray(specValues)) return ''
+  return Object.entries(specValues)
+    .map(([key, value]) => {
+      const keyText = String(key || '').trim()
+      const valueText = Array.isArray(value)
+        ? value.map((entry) => String(entry || '').trim()).filter(Boolean).join(', ')
+        : String(value ?? '').trim()
+      if (!valueText) return ''
+      if (!keyText) return valueText
+      return `${keyText}:${valueText}`
+    })
+    .filter(Boolean)
+    .join(' / ')
+}
+
+const buildSkuLabel = (sku: AdminProductSKU | null | undefined) => {
+  const skuCode = String(sku?.sku_code || '').trim()
+  const specText = formatSkuSpecValues(sku?.spec_values)
+  if (skuCode && specText) return `${skuCode} · ${specText}`
+  if (skuCode) return skuCode
+  if (specText) return specText
+  if (sku?.id) return `#${sku.id}`
+  return '-'
+}
+
+const buildProductLabel = (product: AdminProduct | null | undefined) => {
+  const id = Number(product?.id || 0)
+  const name = getLocalizedText(product?.title || {})
+  if (id > 0 && name) return `#${id} ${name}`
+  if (id > 0) return `#${id}`
+  return name || '-'
+}
+
+const buildBatchLabel = (batch: AdminCardSecretBatch) => {
+  const batchNo = String(batch?.batch_no || '').trim()
+  const prefix = batchNo ? `${batchNo}` : `#${batch.id}`
+  return `${prefix} · ${t('admin.cardSecrets.stats.available')} ${Number(batch.available_count || 0)}`
+}
+
+const currentProductId = computed(() => parseProductId())
+const currentSkuId = computed(() => parseSkuId())
+const currentBatchId = computed(() => parseBatchId())
+const currentAvailableCount = computed(() => {
+  if (currentBatchId.value) {
+    const batch = batches.value.find((item) => Number(item.id || 0) === currentBatchId.value)
+    return Number(batch?.available_count || 0)
+  }
+  return availableCount.value
+})
+
+const productInfoName = computed(() => {
+  if (productInfo.value) return getLocalizedText(productInfo.value.title)
+  const option = productOptions.value.find((item) => Number(item?.id || 0) === currentProductId.value)
+  if (!option) return ''
+  return getLocalizedText(option.title || {})
+})
+
+const currentProductLabel = computed(() => {
+  if (productInfo.value) return buildProductLabel(productInfo.value)
+  if (currentProductId.value) return `#${currentProductId.value}`
+  return '-'
+})
+
+const availableSkus = computed(() => {
+  const rows = Array.isArray(productInfo.value?.skus) ? productInfo.value.skus : []
+  return rows
+    .filter((sku: AdminProductSKU) => Boolean(sku?.is_active))
+    .map((sku: AdminProductSKU) => ({
+      ...sku,
+      id: Number(sku.id),
+      label: buildSkuLabel(sku),
+    }))
+    .filter((sku: AdminProductSKU & { label: string }) => Number.isFinite(sku.id) && sku.id > 0)
+})
+
+const skuFilterDisabled = computed(() => !currentProductId.value || availableSkus.value.length === 0)
+const currentSkuLabel = computed(() => {
+  if (!currentSkuId.value) return t('admin.cardSecrets.skuAll')
+  const matched = availableSkus.value.find((sku) => sku.id === currentSkuId.value)
+  if (!matched) return `#${currentSkuId.value}`
+  return matched.label
+})
+
+const exportDisabled = computed(() => {
+  return exporting.value || !currentProductId.value || exportCount.value <= 0 || exportCount.value > currentAvailableCount.value
+})
+
+const productLink = (productId: number) => adminHref(`/products?product_id=${productId}`)
+
+const resetMessages = () => {
+  successMessage.value = ''
+  errorMessage.value = ''
+}
+
+const syncSkuSelection = () => {
+  if (!currentProductId.value || availableSkus.value.length === 0) {
+    skuFilterValue.value = '__all__'
+    return
+  }
+  const matched = availableSkus.value.some((sku) => sku.id === currentSkuId.value)
+  if (currentSkuId.value && !matched) {
+    skuFilterValue.value = '__all__'
+  }
+}
+
+const loadProductOptions = async () => {
+  productOptionsLoading.value = true
+  try {
+    const keyword = String(productKeyword.value || '').trim()
+    const rows: AdminProduct[] = []
+    let page = 1
+    let totalPage = 1
+    do {
+      const response = await adminAPI.getProducts({
+        page,
+        page_size: 100,
+        search: keyword || undefined,
+        fulfillment_type: 'auto',
+      })
+      const list = Array.isArray(response.data.data) ? response.data.data : []
+      rows.push(...list.filter((item: AdminProduct) => String(item?.fulfillment_type || '').trim() === 'auto'))
+      totalPage = Number(response.data?.pagination?.total_page || 1)
+      page += 1
+    } while (page <= totalPage && page <= 20)
+
+    const dedup = new Map<number, AdminProduct>()
+    rows.forEach((item: AdminProduct) => {
+      const id = Number(item?.id || 0)
+      if (!Number.isFinite(id) || id <= 0) return
+      if (!dedup.has(id)) dedup.set(id, item)
+    })
+
+    const options = Array.from(dedup.values())
+    if (
+      currentProductId.value &&
+      !options.some((item: AdminProduct) => Number(item?.id || 0) === currentProductId.value)
+    ) {
+      if (productInfo.value && Number(productInfo.value.id || 0) === currentProductId.value) {
+        options.unshift(productInfo.value)
+      } else {
+        options.unshift({
+          id: currentProductId.value,
+          title: {
+            'zh-CN': `#${currentProductId.value}`,
+            'zh-TW': `#${currentProductId.value}`,
+            'en-US': `#${currentProductId.value}`,
+          },
+          fulfillment_type: 'auto',
+        } as unknown as AdminProduct)
+      }
+    }
+
+    productOptions.value = options
+  } catch {
+    productOptions.value = []
+  } finally {
+    productOptionsLoading.value = false
+  }
+}
+
+const loadProductInfo = async () => {
+  const productId = parseProductId()
+  if (!productId) {
+    productInfo.value = null
+    skuFilterValue.value = '__all__'
+    batches.value = []
+    availableCount.value = 0
+    return
+  }
+  try {
+    const response = await adminAPI.getProduct(productId)
+    productInfo.value = response.data.data
+    if (!productOptions.value.some((item: AdminProduct) => Number(item?.id || 0) === productId)) {
+      productOptions.value.unshift(response.data.data)
+    }
+    syncSkuSelection()
+  } catch {
+    productInfo.value = null
+    skuFilterValue.value = '__all__'
+  }
+}
+
+const loadInventoryMeta = async () => {
+  if (!currentProductId.value) {
+    batches.value = []
+    availableCount.value = 0
+    return
+  }
+  batchesLoading.value = true
+  try {
+    const params = {
+      product_id: currentProductId.value,
+      sku_id: currentSkuId.value || undefined,
+    }
+    const [statsResponse, batchesResponse] = await Promise.all([
+      adminAPI.getCardSecretStats(params),
+      adminAPI.getCardSecretBatches({ ...params, page: 1, page_size: 100 }),
+    ])
+    availableCount.value = Number(statsResponse.data?.data?.available || 0)
+    batches.value = Array.isArray(batchesResponse.data?.data) ? batchesResponse.data.data : []
+    if (currentBatchId.value && !batches.value.some((item) => Number(item.id || 0) === currentBatchId.value)) {
+      batchFilterValue.value = '__all__'
+    }
+  } catch {
+    availableCount.value = 0
+    batches.value = []
+  } finally {
+    batchesLoading.value = false
+  }
+}
+
+const handleSearchProducts = async () => {
+  await loadProductOptions()
+}
+
+const debouncedSearchProducts = useDebounceFn(handleSearchProducts, 300)
+
+const handleProductSelectionChange = async () => {
+  resetMessages()
+  skuFilterValue.value = '__all__'
+  batchFilterValue.value = '__all__'
+  exportCount.value = 1
+  await loadProductInfo()
+  await loadInventoryMeta()
+}
+
+const handleSkuSelectionChange = async () => {
+  resetMessages()
+  batchFilterValue.value = '__all__'
+  exportCount.value = 1
+  await loadInventoryMeta()
+}
+
+const downloadExportFile = (response: any, format: 'txt' | 'csv') => {
+  const contentDisposition = String(response?.headers?.['content-disposition'] || '')
+  const filenameMatch = contentDisposition.match(/filename="?([^";]+)"?/i)
+  const fallbackName = `card-secrets-available-${new Date().toISOString().replace(/[:.]/g, '-')}.${format}`
+  const filename = filenameMatch?.[1] || fallbackName
+  const contentType = format === 'csv' ? 'text/csv;charset=utf-8' : 'text/plain;charset=utf-8'
+  const blob = new Blob([response.data], { type: contentType })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
+const submitExport = async () => {
+  resetMessages()
+  if (!currentProductId.value) {
+    errorMessage.value = t('admin.cardSecrets.errors.productRequired')
+    return
+  }
+  if (exportCount.value <= 0 || exportCount.value > currentAvailableCount.value) {
+    errorMessage.value = t('admin.cardSecretExports.errors.countInvalid')
+    return
+  }
+
+  const confirmed = window.confirm(
+    deleteAfterExport.value
+      ? t('admin.cardSecretExports.confirmDelete', { count: exportCount.value })
+      : t('admin.cardSecretExports.confirmUsed', { count: exportCount.value }),
+  )
+  if (!confirmed) return
+
+  exporting.value = true
+  try {
+    const response = await adminAPI.exportAvailableCardSecrets({
+      product_id: currentProductId.value,
+      sku_id: currentSkuId.value || undefined,
+      batch_id: currentBatchId.value || undefined,
+      limit: exportCount.value,
+      format: exportFormat.value,
+      delete_after_export: deleteAfterExport.value,
+    })
+    downloadExportFile(response, exportFormat.value)
+    successMessage.value = deleteAfterExport.value
+      ? t('admin.cardSecretExports.success.deleted', { count: exportCount.value })
+      : t('admin.cardSecretExports.success.used', { count: exportCount.value })
+    await loadInventoryMeta()
+  } catch (error: any) {
+    errorMessage.value = error?.message || t('admin.cardSecretExports.errors.exportFailed')
+  } finally {
+    exporting.value = false
+  }
+}
+
+watch(currentAvailableCount, (count) => {
+  if (count <= 0) {
+    exportCount.value = 1
+    return
+  }
+  if (exportCount.value > count) {
+    exportCount.value = count
+  }
+})
+
+onMounted(async () => {
+  await loadProductOptions()
+})
+</script>
+
+<template>
+  <div class="space-y-6">
+    <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+      <div>
+        <h1 class="text-2xl font-semibold">{{ t('admin.cardSecretExports.title') }}</h1>
+        <p class="mt-1 text-sm text-muted-foreground">{{ t('admin.cardSecretExports.subtitle') }}</p>
+      </div>
+      <Button class="w-full lg:w-auto" variant="outline" as-child>
+        <RouterLink to="/card-secret-imports">
+          <Upload class="mr-2 h-4 w-4" />
+          {{ t('admin.cardSecretExports.importAction') }}
+        </RouterLink>
+      </Button>
+    </div>
+
+    <div class="rounded-xl border border-border bg-card p-4 shadow-sm">
+      <div class="mb-4">
+        <h2 class="text-lg font-semibold text-foreground">{{ t('admin.cardSecretExports.selectionTitle') }}</h2>
+        <p class="mt-1 text-sm text-muted-foreground">{{ t('admin.cardSecretExports.selectionDescription') }}</p>
+      </div>
+
+      <div class="grid grid-cols-1 gap-3 md:grid-cols-12">
+        <div class="flex flex-col gap-2 md:col-span-4 sm:flex-row sm:items-center">
+          <Input
+            v-model="productKeyword"
+            :placeholder="t('admin.cardSecrets.productSearchPlaceholder')"
+            @update:modelValue="debouncedSearchProducts"
+            @keyup.enter="handleSearchProducts"
+          />
+          <Button
+            size="sm"
+            variant="outline"
+            class="h-9 w-full shrink-0 sm:w-auto"
+            :disabled="productOptionsLoading"
+            @click="handleSearchProducts"
+          >
+            {{ productOptionsLoading ? t('admin.common.loading') : t('admin.cardSecrets.searchProducts') }}
+          </Button>
+        </div>
+
+        <div class="md:col-span-4">
+          <Select v-model="selectedProductValue" @update:modelValue="handleProductSelectionChange">
+            <SelectTrigger class="h-10">
+              <SelectValue :placeholder="t('admin.cardSecrets.productSelectPlaceholder')" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">{{ t('admin.cardSecrets.productAll') }}</SelectItem>
+              <SelectItem v-for="product in productOptions" :key="product.id" :value="String(product.id)">
+                {{ buildProductLabel(product) }}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div class="md:col-span-4">
+          <Select v-model="skuFilterValue" :disabled="skuFilterDisabled" @update:modelValue="handleSkuSelectionChange">
+            <SelectTrigger class="h-10">
+              <SelectValue :placeholder="t('admin.cardSecrets.skuPlaceholder')" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">{{ t('admin.cardSecrets.skuAll') }}</SelectItem>
+              <SelectItem v-for="sku in availableSkus" :key="sku.id" :value="String(sku.id)">
+                {{ sku.label }}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div class="mt-4 space-y-1 text-xs text-muted-foreground">
+        <p v-if="!currentProductId">{{ t('admin.cardSecretExports.selectionTip') }}</p>
+        <p v-else>{{ t('admin.cardSecrets.productHintCurrent', { id: currentProductId }) }}</p>
+        <p v-if="productInfoName">
+          {{ t('admin.cardSecrets.productNameLabel') }}：
+          <a
+            v-if="currentProductId"
+            :href="productLink(currentProductId)"
+            target="_blank"
+            rel="noopener"
+            class="text-primary underline-offset-4 hover:underline"
+          >
+            {{ productInfoName }}
+          </a>
+          <span v-else>{{ productInfoName }}</span>
+        </p>
+        <p v-if="currentProductId">
+          {{ t('admin.cardSecrets.skuLabel') }}：{{ currentSkuLabel }}
+        </p>
+      </div>
+    </div>
+
+    <div v-if="!currentProductId" class="rounded-xl border-2 border-dashed border-primary/30 bg-primary/5 p-8">
+      <div class="mx-auto max-w-xl space-y-4 text-center">
+        <div class="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-primary/10">
+          <PackageCheck class="h-8 w-8 text-primary" />
+        </div>
+        <h2 class="text-xl font-semibold text-foreground">{{ t('admin.cardSecretExports.emptyTitle') }}</h2>
+        <p class="text-sm text-muted-foreground">{{ t('admin.cardSecretExports.emptyDescription') }}</p>
+      </div>
+    </div>
+
+    <div v-else class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
+      <div class="space-y-4 rounded-xl border border-border bg-card p-4 shadow-sm">
+        <div>
+          <h2 class="text-lg font-semibold text-foreground">{{ t('admin.cardSecretExports.formTitle') }}</h2>
+          <p class="mt-1 text-sm text-muted-foreground">{{ t('admin.cardSecretExports.formDescription') }}</p>
+        </div>
+
+        <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div class="space-y-2">
+            <label class="text-xs font-medium text-muted-foreground">{{ t('admin.cardSecretExports.batchLabel') }}</label>
+            <Select v-model="batchFilterValue" :disabled="batchesLoading || batches.length === 0">
+              <SelectTrigger class="h-10">
+                <SelectValue :placeholder="t('admin.cardSecretExports.batchPlaceholder')" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__all__">{{ t('admin.cardSecretExports.batchAll') }}</SelectItem>
+                <SelectItem v-for="batch in batches" :key="batch.id" :value="String(batch.id)">
+                  {{ buildBatchLabel(batch) }}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div class="space-y-2">
+            <label class="text-xs font-medium text-muted-foreground">{{ t('admin.cardSecretExports.countLabel') }}</label>
+            <Input v-model.number="exportCount" type="number" min="1" :max="currentAvailableCount || undefined" step="1" />
+            <p class="text-xs text-muted-foreground">
+              {{ t('admin.cardSecretExports.availableHint', { count: currentAvailableCount }) }}
+            </p>
+          </div>
+
+          <div class="space-y-2">
+            <label class="text-xs font-medium text-muted-foreground">{{ t('admin.cardSecretExports.formatLabel') }}</label>
+            <Select v-model="exportFormat">
+              <SelectTrigger class="h-10">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="txt">TXT</SelectItem>
+                <SelectItem value="csv">CSV</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+
+        <div class="flex items-start gap-3 rounded-lg border border-destructive/20 bg-destructive/5 p-3">
+          <Checkbox
+            :model-value="deleteAfterExport"
+            @update:model-value="(v) => deleteAfterExport = !!v"
+            class="mt-0.5"
+          />
+          <div>
+            <p class="text-sm font-medium text-foreground">{{ t('admin.cardSecretExports.deleteAfterExport') }}</p>
+            <p class="mt-1 text-xs text-muted-foreground">{{ t('admin.cardSecretExports.deleteAfterExportHint') }}</p>
+          </div>
+        </div>
+
+        <div v-if="successMessage" class="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
+          {{ successMessage }}
+        </div>
+        <div v-if="errorMessage" class="rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          {{ errorMessage }}
+        </div>
+
+        <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-end">
+          <Button variant="outline" :disabled="exporting" @click="loadInventoryMeta">
+            {{ t('admin.common.refresh') }}
+          </Button>
+          <Button :disabled="exportDisabled" @click="submitExport">
+            <Download class="mr-2 h-4 w-4" />
+            {{ exporting ? t('admin.cardSecretExports.exporting') : t('admin.cardSecretExports.submit') }}
+          </Button>
+        </div>
+      </div>
+
+      <div class="rounded-xl border border-primary/20 bg-primary/5 p-4">
+        <p class="text-sm font-medium text-foreground">{{ t('admin.cardSecretExports.targetTitle') }}</p>
+        <p class="mt-2 text-sm text-muted-foreground">{{ currentProductLabel }}</p>
+        <p class="mt-1 text-xs text-muted-foreground">
+          {{ t('admin.cardSecrets.skuLabel') }}：{{ currentSkuLabel }}
+        </p>
+        <div class="mt-4 grid grid-cols-2 gap-3">
+          <div class="rounded-lg border border-border bg-background p-3">
+            <p class="text-xs text-muted-foreground">{{ t('admin.cardSecrets.stats.available') }}</p>
+            <p class="mt-1 text-2xl font-semibold text-emerald-600">{{ currentAvailableCount }}</p>
+          </div>
+          <div class="rounded-lg border border-border bg-background p-3">
+            <p class="text-xs text-muted-foreground">{{ t('admin.cardSecretExports.batchCount') }}</p>
+            <p class="mt-1 text-2xl font-semibold text-foreground">{{ batches.length }}</p>
+          </div>
+        </div>
+        <p class="mt-4 text-xs text-muted-foreground">{{ t('admin.cardSecretExports.targetHint') }}</p>
+      </div>
+    </div>
+  </div>
+</template>

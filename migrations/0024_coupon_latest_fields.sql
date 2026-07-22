@@ -1,0 +1,2 @@
+ALTER TABLE coupons ADD COLUMN disabled_wholesale_price INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE coupons ADD COLUMN per_item_discount INTEGER NOT NULL DEFAULT 0;

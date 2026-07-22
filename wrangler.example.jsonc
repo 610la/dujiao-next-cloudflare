@@ -1,0 +1,32 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "dujiao-next-cloudflare",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-04-08",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  },
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "REPLACE_WITH_D1_DATABASE_NAME",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "DUJIAO_UPLOADS",
+      "id": "00000000000000000000000000000000"
+    }
+  ]
+}

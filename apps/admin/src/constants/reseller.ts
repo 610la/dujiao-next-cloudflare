@@ -1,0 +1,42 @@
+export const RESELLER_LEDGER_TYPE_ORDER_PROFIT = 'order_profit'
+export const RESELLER_LEDGER_TYPE_REFUND_DEDUCT = 'refund_deduct'
+export const RESELLER_LEDGER_TYPE_MANUAL_ADJUST = 'manual_adjust'
+export const RESELLER_LEDGER_TYPE_WITHDRAW_LOCK = 'withdraw_lock'
+export const RESELLER_LEDGER_TYPE_WITHDRAW_PAID = 'withdraw_paid'
+
+export const RESELLER_PROFILE_STATUS_PENDING_REVIEW = 'pending_review'
+export const RESELLER_PROFILE_STATUS_ACTIVE = 'active'
+export const RESELLER_PROFILE_STATUS_REJECTED = 'rejected'
+export const RESELLER_PROFILE_STATUS_DISABLED = 'disabled'
+
+export const RESELLER_SETTLEMENT_STATUS_NORMAL = 'normal'
+export const RESELLER_SETTLEMENT_STATUS_FROZEN = 'frozen'
+
+export const RESELLER_DOMAIN_TYPE_SUBDOMAIN = 'subdomain'
+export const RESELLER_DOMAIN_TYPE_CUSTOM = 'custom'
+export const RESELLER_DOMAIN_STATUS_PENDING_REVIEW = 'pending_review'
+export const RESELLER_DOMAIN_STATUS_ACTIVE = 'active'
+export const RESELLER_DOMAIN_STATUS_DISABLED = 'disabled'
+export const RESELLER_DOMAIN_VERIFICATION_PENDING = 'pending'
+export const RESELLER_DOMAIN_VERIFICATION_VERIFIED = 'verified'
+export const RESELLER_DOMAIN_VERIFICATION_FAILED = 'failed'
+
+export const RESELLER_LEDGER_STATUS_PENDING_CONFIRM = 'pending_confirm'
+export const RESELLER_LEDGER_STATUS_AVAILABLE = 'available'
+export const RESELLER_LEDGER_STATUS_LOCKED = 'locked'
+export const RESELLER_LEDGER_STATUS_WITHDRAWN = 'withdrawn'
+export const RESELLER_LEDGER_STATUS_CANCELED = 'canceled'
+
+export const RESELLER_WITHDRAW_STATUS_PENDING = 'pending'
+export const RESELLER_WITHDRAW_STATUS_REJECTED = 'rejected'
+export const RESELLER_WITHDRAW_STATUS_PAID = 'paid'
+
+export const RESELLER_BALANCE_STATUS_NORMAL = 'normal'
+export const RESELLER_BALANCE_STATUS_NEGATIVE = 'negative_balance'
+export const RESELLER_BALANCE_STATUS_FROZEN_REVIEW = 'frozen_review'
+export const RESELLER_BALANCE_STATUS_DISABLED = 'disabled'
+
+export const RESELLER_PRICING_MODE_INHERIT = 'inherit'
+export const RESELLER_PRICING_MODE_MARKUP_PERCENT = 'markup_percent'
+export const RESELLER_PRICING_MODE_FIXED_MARKUP = 'fixed_markup'
+export const RESELLER_PRICING_MODE_FIXED_PRICE = 'fixed_price'

@@ -1,0 +1,25 @@
+{
+  "name": "dujiao-next-cloudflare",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "install:apps": "pnpm install",
+    "build:user": "pnpm --dir apps/user build",
+    "build:admin": "pnpm --dir apps/admin build",
+    "build": "pnpm run build:user && pnpm run build:admin && node scripts/assemble-dist.mjs",
+    "dev": "pnpm exec wrangler dev --local --port 8787",
+    "typecheck": "pnpm exec tsc --noEmit",
+    "test:user": "node --test apps/user/tests/*.test.ts",
+    "db:local": "pnpm exec wrangler d1 migrations apply DB --local",
+    "db:remote": "pnpm exec wrangler d1 migrations apply DB --remote",
+    "admin:create:local": "node scripts/create-admin.mjs --local",
+    "admin:create:remote": "node scripts/create-admin.mjs --remote",
+    "deploy": "pnpm run build && pnpm run db:remote && pnpm exec wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20260414.1",
+    "typescript": "5.9.3",
+    "wrangler": "4.80.0"
+  }
+}

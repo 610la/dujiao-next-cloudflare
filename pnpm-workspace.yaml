@@ -1,0 +1,13 @@
+packages:
+  - "apps/user"
+  - "apps/admin"
+
+allowBuilds:
+  esbuild: true
+  sharp: true
+  vue-demi: true
+  workerd: true
+
+onlyBuiltDependencies:
+  - esbuild
+  - vue-demi

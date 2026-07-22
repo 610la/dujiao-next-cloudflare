@@ -1,0 +1,36 @@
+# git-cliff 配置：按 commit prefix 自动分组生成 release notes
+# 与 api/.goreleaser.yaml 中 changelog.groups 保持一致
+
+[changelog]
+header = ""
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\\n") | first | trim }}{% if commit.id %} ({{ commit.id | truncate(length=7, end="") }}){% endif %}
+{%- endfor %}
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+commit_parsers = [
+  { message = "^feat",     group = "🚀 Features" },
+  { message = "^fix",      group = "🐛 Bug Fixes" },
+  { message = "^perf",     group = "⚡ Performance" },
+  { message = "^refactor", group = "🔨 Refactor" },
+  { message = "^docs",     group = "📝 Documentation" },
+  { message = "^test",     skip = true },
+  { message = "^chore",    skip = true },
+  { message = "^ci",       skip = true },
+  { message = "^build",    skip = true },
+  { message = "^Merge",    skip = true },
+  { message = ".*",        group = "其他" },
+]
+filter_commits = false
+tag_pattern = "v[0-9]*"
+sort_commits = "oldest"

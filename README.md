@@ -1,10 +1,10 @@
-# Dujiao Next for Cloudflare
+# Dujiao Next Cloudflare 发卡网
 
 [中文](#中文) | [English](#english)
 
 ## 中文
 
-基于 Dujiao Next 的 Cloudflare 原生适配版本。项目保留原有 Vue 前台与管理后台，并将后端能力迁移到 Cloudflare Workers、D1 和 KV，无需单独购买 VPS。
+基于 Dujiao Next 的 Cloudflare 原生发卡网与数字商品商城，支持自动卡密发货、人工交付、会员、订单、库存和支付管理。项目保留原有 Vue 前台与管理后台，并将后端能力迁移到 Cloudflare Workers、D1 和 KV，无需单独购买 VPS。
 
 原版项目仓库：[dujiao-next/dujiao-next](https://github.com/dujiao-next/dujiao-next)
 
@@ -53,7 +53,7 @@ pnpm run build
 
 ## English
 
-A Cloudflare-native port of Dujiao Next. It keeps the original Vue storefront and admin application while moving backend services to Cloudflare Workers, D1, and KV, so no separate VPS is required.
+A Cloudflare-native digital-goods and card-secret storefront based on Dujiao Next, with automatic delivery, manual fulfillment, members, orders, inventory, and payment management. It keeps the original Vue storefront and admin application while moving backend services to Cloudflare Workers, D1, and KV, so no separate VPS is required.
 
 Upstream repository: [dujiao-next/dujiao-next](https://github.com/dujiao-next/dujiao-next)
 

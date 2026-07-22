@@ -30,7 +30,7 @@ Edit `config/project.json`:
 - `adminPath` accepts letters, numbers, hyphens, and underscores.
 - `siteUrl` is the final public origin without a trailing slash.
 
-These values are not credentials, but they must be correct before the first build. Rebuild and redeploy after changing the admin path.
+Set both values correctly before the first build. Rebuild and redeploy after changing the admin path.
 
 ## 3. Create D1 and KV resources
 
@@ -53,7 +53,7 @@ Bash:
 cp wrangler.example.jsonc wrangler.jsonc
 ```
 
-Put the returned D1 `database_name`, D1 `database_id`, and KV `id` into `wrangler.jsonc`. The file is ignored by Git.
+Put the returned D1 `database_name`, D1 `database_id`, and KV `id` into `wrangler.jsonc`.
 
 ## 4. Initialize the database
 
@@ -61,7 +61,7 @@ Put the returned D1 `database_name`, D1 `database_id`, and KV `id` into `wrangle
 pnpm run db:remote
 ```
 
-The new database contains no default administrator, sample product, order, or payment channel.
+After the migrations finish, create the first administrator.
 
 ## 5. Create the first administrator
 
@@ -142,8 +142,6 @@ pnpm run typecheck
 pnpm run test:user
 pnpm run deploy
 ```
-
-Never commit database exports, `.dev.vars`, `wrangler.jsonc`, or API credentials.
 
 ## 10. Troubleshooting
 

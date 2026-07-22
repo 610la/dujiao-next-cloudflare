@@ -35,7 +35,7 @@ pnpm exec wrangler login
 - `adminPath`：后台页面路径，只能使用英文字母、数字、短横线和下划线。
 - `siteUrl`：站点最终访问地址，不要以 `/` 结尾。
 
-这两个值不是密钥，但应在首次构建前设置正确。修改后台路径后必须重新构建并重新部署。
+请在首次构建前设置正确。修改后台路径后必须重新构建并重新部署。
 
 ## 3. 创建 D1 和 KV
 
@@ -65,7 +65,7 @@ Bash：
 cp wrangler.example.jsonc wrangler.jsonc
 ```
 
-把 Cloudflare 返回的 `database_name`、`database_id` 和 KV `id` 填入 `wrangler.jsonc`。该文件已被 `.gitignore` 忽略，不会被提交。
+把 Cloudflare 返回的 `database_name`、`database_id` 和 KV `id` 填入 `wrangler.jsonc`。
 
 ## 4. 初始化数据库
 
@@ -75,7 +75,7 @@ cp wrangler.example.jsonc wrangler.jsonc
 pnpm run db:remote
 ```
 
-新数据库是空的，不包含默认管理员、示例商品、订单或支付渠道。
+迁移完成后，继续创建首个管理员。
 
 ## 5. 创建首个管理员
 
@@ -173,7 +173,7 @@ pnpm run test:user
 pnpm run deploy
 ```
 
-执行迁移或发布重要版本前，先导出 D1 数据。不要把数据库导出、`.dev.vars`、`wrangler.jsonc` 或任何 API 密钥提交到 Git。
+执行迁移或发布重要版本前，先导出 D1 数据。
 
 ## 10. 常见问题
 

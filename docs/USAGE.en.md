@@ -83,6 +83,5 @@ Members may access only their own orders. Guests must keep the order number, loo
 
 - Export D1 regularly and test restoration.
 - Review Worker errors, failed payments, and failed email deliveries.
-- Never commit API keys, payment keys, card secrets, or database backups.
 - Back up before updates; run migrations, tests, and a low-value payment test afterward.
 - Rotate administrator passwords and audit administrator roles regularly.

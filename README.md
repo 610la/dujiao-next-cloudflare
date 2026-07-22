@@ -8,7 +8,7 @@
 
 原版项目仓库：[dujiao-next/dujiao-next](https://github.com/dujiao-next/dujiao-next)
 
-> 本项目由 ChatGPT / Codex 辅助完成 Cloudflare 适配与代码重构，是社区维护的非官方移植版本，与 Dujiao Next 官方无隶属关系。部分实现可能与原版存在差异。
+> 本项目基于 Dujiao Next 修改，于 2026 年由 ChatGPT / Codex 辅助完成 Cloudflare 适配与代码重构。它是社区维护的非官方移植版本，与 Dujiao Next 官方无隶属关系，部分实现可能与原版存在差异。
 
 ### 功能
 
@@ -57,7 +57,7 @@ A Cloudflare-native port of Dujiao Next. It keeps the original Vue storefront an
 
 Upstream repository: [dujiao-next/dujiao-next](https://github.com/dujiao-next/dujiao-next)
 
-> This is an unofficial, community-maintained port adapted and refactored for Cloudflare with assistance from ChatGPT / Codex. It is not affiliated with the Dujiao Next maintainers, and some implementations may differ from upstream.
+> This project is based on Dujiao Next and was adapted and refactored for Cloudflare in 2026 with assistance from ChatGPT / Codex. It is an unofficial, community-maintained port, is not affiliated with the Dujiao Next maintainers, and may differ from upstream.
 
 ### Features
 
@@ -102,4 +102,4 @@ The default admin path is `/admin-panel/`; change it before the first production
 
 ## License
 
-This project includes code derived from Dujiao Next and is distributed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE).
+This project includes code derived from Dujiao Next and is distributed under the GNU General Public License v3.0. See [LICENSE](LICENSE).

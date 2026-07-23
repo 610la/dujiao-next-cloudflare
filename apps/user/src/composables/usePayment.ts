@@ -155,9 +155,9 @@ export function usePayment() {
     return filtered
   }
 
-  const configReady = computed(() => !appStore.loading && (!!appStore.config || (!isGuest.value && orderPaymentChannelsLoaded.value)))
+  const configReady = computed(() => orderPaymentChannelsLoaded.value || (!appStore.loading && !!appStore.config))
   const channels = computed(() => {
-    if (!isGuest.value && orderPaymentChannelsLoaded.value) {
+    if (orderPaymentChannelsLoaded.value) {
       return filterChannelsByOrder(orderPaymentChannels.value)
     }
     const fallback = appStore.config?.payment_channels
@@ -557,8 +557,9 @@ export function usePayment() {
 
   const loadOrderPaymentChannels = async () => {
     if (isGuest.value) {
-      orderPaymentChannels.value = []
-      orderPaymentChannelsLoaded.value = false
+      if (!orderPaymentChannelsLoaded.value) {
+        orderPaymentChannels.value = []
+      }
       return
     }
     if (!orderNoResolved.value) {
@@ -1104,23 +1105,15 @@ export function usePayment() {
       redirectTimer.value = null
     }
 
-    redirectTimer.value = window.setTimeout(async () => {
-      try {
-        const failure = await router.push(target)
-        if (failure && !isNavigationFailure(failure, NavigationFailureType.duplicated)) {
-          resetRedirectState()
-          window.location.assign(fallbackPath)
-        }
-      } catch (_err) {
+    void router.push(target).then((failure) => {
+      if (failure && !isNavigationFailure(failure, NavigationFailureType.duplicated)) {
         resetRedirectState()
         window.location.assign(fallbackPath)
-      } finally {
-        if (redirectTimer.value !== null) {
-          window.clearTimeout(redirectTimer.value)
-          redirectTimer.value = null
-        }
       }
-    }, 600)
+    }).catch(() => {
+      resetRedirectState()
+      window.location.assign(fallbackPath)
+    })
   }
 
   const resetPayment = (reason: PaymentResetReason = 'generic') => {
@@ -1270,10 +1263,24 @@ export function usePayment() {
       ? consumeCheckoutOrderSnapshot(orderNoQuery.value)
       : null
     if (checkoutOrder) {
-      order.value = checkoutOrder
+      const snapshotChannels = Array.isArray(checkoutOrder.__checkout_payment_channels)
+        ? checkoutOrder.__checkout_payment_channels
+        : null
+      if (snapshotChannels) {
+        orderPaymentChannels.value = snapshotChannels
+        orderPaymentChannelsLoaded.value = true
+      }
+      if (checkoutOrder.__checkout_wallet_balance !== undefined) {
+        walletBalance.value = String(checkoutOrder.__checkout_wallet_balance || '0')
+      }
+      const {
+        __checkout_payment_channels: _snapshotChannels,
+        __checkout_wallet_balance: _snapshotWalletBalance,
+        ...snapshotOrder
+      } = checkoutOrder
+      order.value = snapshotOrder
       latestLoaded.value = true
       loading.value = false
-      void loadOrder({ silent: true })
     } else {
       void loadOrder()
     }
@@ -1324,7 +1331,11 @@ export function usePayment() {
   watch(
     () => [isGuest.value, orderNoResolved.value, requiresOnlineChannel.value, expectedOnlinePayCents.value, order.value?.status],
     () => {
-      void debouncedLoadOrderPaymentChannels()
+      if (autoPayRequested.value) {
+        void loadOrderPaymentChannels()
+      } else {
+        void debouncedLoadOrderPaymentChannels()
+      }
     },
     { immediate: true }
   )

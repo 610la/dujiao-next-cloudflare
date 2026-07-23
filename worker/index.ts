@@ -866,6 +866,7 @@ const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const PROCUREMENT_CRON_BATCH_SIZE = 20;
 const DOWNSTREAM_CALLBACK_CRON_BATCH_SIZE = 20;
 const CACHEABLE_SETTING_KEYS = new Set([
+  "atomic_wallet_adjustments_enabled",
   "callback_routes_config",
   "site_config",
   "order_risk_control_config",
@@ -874,6 +875,18 @@ const CACHEABLE_SETTING_KEYS = new Set([
 ]);
 const SETTING_CACHE_TTL_MS = 30_000;
 const settingCache = new Map<string, { raw: string | null; expiresAt: number }>();
+const PUBLIC_CONFIG_CACHE_TTL_MS = 30_000;
+const PAYMENT_CHANNEL_CACHE_TTL_MS = 10_000;
+let activePaymentChannelCache: { rows: PaymentChannelRow[]; expiresAt: number } | null = null;
+const PUBLIC_CONFIG_SETTING_KEYS = new Set([
+  "site_config",
+  "registration_config",
+  "captcha",
+  "telegram_auth",
+  "home_announcement",
+  "wallet_config"
+]);
+const publicConfigCache = new Map<string, { value: AnyRecord; expiresAt: number }>();
 
 class ApiRequestError extends Error {
   constructor(readonly status: number, message: string) {
@@ -898,7 +911,7 @@ export default {
         const callbackRoute = await resolveCallbackRoute(env, url.pathname);
         const method = request.method.toUpperCase();
         if (callbackRoute === "payment" && (method === "GET" || method === "POST")) {
-          return apiPaymentCallback(request, env, url);
+          return apiPaymentCallback(request, env, url, ctx);
         }
         if (callbackRoute === "upstream" && method === "POST") {
           return apiUpstreamCallback(request, env, url);
@@ -935,7 +948,7 @@ async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionCon
   const callbackRoute = await resolveCallbackRoute(env, url.pathname);
   if (callbackRoute === "blocked") return apiError("not_found", 404);
   if (callbackRoute === "payment" && (method === "GET" || method === "POST")) {
-    return apiPaymentCallback(request, env, url);
+    return apiPaymentCallback(request, env, url, ctx);
   }
   if (callbackRoute === "upstream" && method === "POST") {
     return apiUpstreamCallback(request, env, url);
@@ -1001,7 +1014,7 @@ async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionCon
     return apiGuestCapturePayment(request, env, Number(path.split("/").at(-2)));
   }
   if ((method === "GET" || method === "POST") && path === "/payments/callback") {
-    return apiPaymentCallback(request, env, url);
+    return apiPaymentCallback(request, env, url, ctx);
   }
   if (method === "POST" && path === "/payments/webhook/dujiaopay") {
     return apiDujiaoPayWebhook(request, env, url);
@@ -2406,6 +2419,8 @@ async function apiAdminPaymentChannel(env: Env, id: number): Promise<Response> {
 async function apiAdminCreatePaymentChannel(request: Request, env: Env): Promise<Response> {
   const body = await readJson(request);
   const id = await savePaymentChannel(env, body);
+  publicConfigCache.clear();
+  activePaymentChannelCache = null;
   const row = await env.DB.prepare("SELECT * FROM payment_channels WHERE id=?").bind(id).first<PaymentChannelRow>();
   return apiOk(row ? formatPaymentChannel(row) : {});
 }
@@ -2415,6 +2430,8 @@ async function apiAdminUpdatePaymentChannel(request: Request, env: Env, id: numb
   if (!exists) return apiError("支付渠道不存在", 404);
   const body = await readJson(request);
   await savePaymentChannel(env, body, id);
+  publicConfigCache.clear();
+  activePaymentChannelCache = null;
   const row = await env.DB.prepare("SELECT * FROM payment_channels WHERE id=?").bind(id).first<PaymentChannelRow>();
   return apiOk(row ? formatPaymentChannel(row) : {});
 }
@@ -2422,9 +2439,13 @@ async function apiAdminUpdatePaymentChannel(request: Request, env: Env, id: numb
 async function apiAdminDeletePaymentChannel(env: Env, id: number): Promise<Response> {
   if (id === 1) {
     await env.DB.prepare("UPDATE payment_channels SET is_active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(id).run();
+    publicConfigCache.clear();
+    activePaymentChannelCache = null;
     return apiOk({});
   }
   await env.DB.prepare("DELETE FROM payment_channels WHERE id=?").bind(id).run();
+  publicConfigCache.clear();
+  activePaymentChannelCache = null;
   return apiOk({});
 }
 
@@ -4246,6 +4267,13 @@ async function apiAdminDeleteApiCredential(env: Env, id: number): Promise<Respon
 
 async function apiPublicConfig(request: Request, env: Env): Promise<Response> {
   const resellerContext = await resolveResellerContextFromRequest(request, env);
+  const cacheKey = resellerContext
+    ? `reseller:${Number(resellerContext.profile.id || 0)}:${clean(resellerContext.domain.domain, 255)}`
+    : "main";
+  const cached = publicConfigCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return apiOk({ ...cloneJsonRecord(cached.value), server_time: Date.now() });
+  }
   const publicSettingKeys = [
     "site_config",
     "registration_config",
@@ -4264,6 +4292,12 @@ async function apiPublicConfig(request: Request, env: Env): Promise<Response> {
     ((settingsResult.results || []) as Array<{ key: string; value_json: string }>)
       .map((row) => [row.key, row.value_json] as const)
   );
+  const settingsExpiresAt = Date.now() + SETTING_CACHE_TTL_MS;
+  for (const key of publicSettingKeys) {
+    if (CACHEABLE_SETTING_KEYS.has(key)) {
+      settingCache.set(key, { raw: publicSettings.get(key) ?? null, expiresAt: settingsExpiresAt });
+    }
+  }
   const readPublicSetting = <T>(key: string, fallback: T): T => {
     const raw = publicSettings.get(key);
     return raw === undefined ? fallback : jsonParse(raw, fallback);
@@ -4299,10 +4333,18 @@ async function apiPublicConfig(request: Request, env: Env): Promise<Response> {
   );
   if (homeAnnouncement) value.announcement = homeAnnouncement;
   const channels = (channelsResult.results || []) as PaymentChannelRow[];
+  activePaymentChannelCache = {
+    rows: channels,
+    expiresAt: Date.now() + PAYMENT_CHANNEL_CACHE_TTL_MS
+  };
   value.payment_channels = channels.map(formatPublicPaymentChannel);
   const wallet = jsonObject(readPublicSetting("wallet_config", {}));
   value.wallet_recharge_channel_ids = arrayNumbers(wallet.recharge_channel_ids);
   value.wallet_only_payment = wallet.wallet_only_payment === true;
+  publicConfigCache.set(cacheKey, {
+    value: cloneJsonRecord(value),
+    expiresAt: Date.now() + PUBLIC_CONFIG_CACHE_TTL_MS
+  });
   value.server_time = Date.now();
   return apiOk(value);
 }
@@ -4645,7 +4687,6 @@ async function apiPublicPostCategories(env: Env): Promise<Response> {
 }
 
 async function apiPublicProducts(request: Request, env: Env, url: URL): Promise<Response> {
-  await cancelExpiredPendingOrders(env);
   const resellerContext = await resolveResellerContextFromRequest(request, env);
   const { page, size, offset } = paging(url);
   const search = clean(url.searchParams.get("search"), 100);
@@ -4664,20 +4705,34 @@ async function apiPublicProducts(request: Request, env: Env, url: URL): Promise<
     const rows = await env.DB.prepare(
       `SELECT p.* FROM products p ${where} ORDER BY p.sort_order ASC, p.id DESC`
     ).bind(...params).all<ProductRow>();
-    const hydrated = await Promise.all((rows.results || []).map((row) => hydrateProduct(env, row, { publicOnly: true, resellerContext })));
+    const productRows = rows.results || [];
+    const preload = await preloadProductHydration(env, productRows);
+    const hydrated = await Promise.all(productRows.map((row) => hydrateProduct(env, row, {
+      publicOnly: true,
+      resellerContext,
+      includeRelatedPosts: false,
+      preload
+    })));
     const products = hydrated.filter((item): item is AnyRecord => !!item);
     return apiOk(products.slice(offset, offset + size), pagination(page, size, products.length));
   }
-  const total = await count(env, `SELECT COUNT(*) AS count FROM products p ${where}`, params);
-  const rows = await env.DB.prepare(
-    `SELECT p.* FROM products p ${where} ORDER BY p.sort_order ASC, p.id DESC LIMIT ? OFFSET ?`
-  ).bind(...params, size, offset).all<ProductRow>();
-  const products = await Promise.all((rows.results || []).map((row) => hydrateProduct(env, row, { publicOnly: true })));
+  const [total, rows] = await Promise.all([
+    count(env, `SELECT COUNT(*) AS count FROM products p ${where}`, params),
+    env.DB.prepare(
+      `SELECT p.* FROM products p ${where} ORDER BY p.sort_order ASC, p.id DESC LIMIT ? OFFSET ?`
+    ).bind(...params, size, offset).all<ProductRow>()
+  ]);
+  const productRows = rows.results || [];
+  const preload = await preloadProductHydration(env, productRows);
+  const products = await Promise.all(productRows.map((row) => hydrateProduct(env, row, {
+    publicOnly: true,
+    includeRelatedPosts: false,
+    preload
+  })));
   return apiOk(products, pagination(page, size, total));
 }
 
 async function apiPublicProduct(request: Request, env: Env, slug: string): Promise<Response> {
-  await cancelExpiredPendingOrders(env);
   const resellerContext = await resolveResellerContextFromRequest(request, env);
   const row = await env.DB.prepare("SELECT * FROM products WHERE slug = ? AND is_active = 1")
     .bind(slug)
@@ -4694,8 +4749,10 @@ async function apiOrderPreview(request: Request, env: Env, user?: UserRow): Prom
   if (!calc.ok) return apiError(calc.error, 400);
   let walletPaidAmount = 0;
   if (user && body.use_balance === true && calc.totalAmount > 0) {
-    const wallet = await ensureWallet(env, user.id);
-    walletPaidAmount = centsToMoney(Math.min(moneyToCents(Number(wallet.balance || 0)), moneyToCents(calc.totalAmount)));
+    walletPaidAmount = centsToMoney(Math.min(
+      moneyToCents(Number((user as AnyRecord).wallet_balance || 0)),
+      moneyToCents(calc.totalAmount)
+    ));
   }
   const onlinePaidAmount = centsToMoney(moneyToCents(calc.totalAmount) - moneyToCents(walletPaidAmount));
   const channels = await availableOrderPaymentChannels(
@@ -4744,7 +4801,7 @@ function normalizeCheckoutRequestId(value: unknown): string {
 async function checkoutOrderByRequestId(env: Env, requestId: string): Promise<OrderRow | null> {
   if (!requestId) return null;
   return env.DB.prepare(
-    "SELECT * FROM orders WHERE checkout_request_id=? AND parent_id IS NULL LIMIT 1"
+    "SELECT * FROM orders WHERE checkout_request_id=? AND checkout_request_id<>'' AND parent_id IS NULL LIMIT 1"
   ).bind(requestId).first<OrderRow>();
 }
 
@@ -4853,11 +4910,10 @@ async function apiGuestCreateOrder(
   ]);
   if (!calc.ok) return apiError(calc.error, 400);
 
-  let wallet: WalletRow | null = null;
+  const availableWalletBalance = Number((user as AnyRecord | undefined)?.wallet_balance || 0);
   if (walletSettings.walletOnlyPayment) {
     if (!user) return apiError("站点当前仅支持登录会员使用钱包余额支付", 400);
-    wallet = await ensureWallet(env, user.id);
-    if (moneyToCents(Number(wallet.balance || 0)) < moneyToCents(calc.totalAmount)) {
+    if (moneyToCents(availableWalletBalance) < moneyToCents(calc.totalAmount)) {
       return apiError("钱包余额不足，请先充值后再下单", 400);
     }
   }
@@ -4866,11 +4922,22 @@ async function apiGuestCreateOrder(
   const guestPasswordSalt = user ? "" : randomToken().slice(0, 16);
   const guestPasswordHash = user ? "" : await hashPassword(guestPassword, guestPasswordSalt);
   const now = new Date().toISOString();
-  let walletPaidAmount = 0;
+  const requestedChannelId = toInt(body.channel_id, 0);
+  const deferProviderPayment = createAndPay && body.defer_payment === true;
+  let requestedWalletPaidAmount = 0;
   if (createAndPay && user && (body.use_balance === true || walletSettings.walletOnlyPayment) && calc.totalAmount > 0) {
-    wallet ||= await ensureWallet(env, user.id);
-    walletPaidAmount = centsToMoney(Math.min(moneyToCents(Number(wallet.balance || 0)), moneyToCents(calc.totalAmount)));
+    requestedWalletPaidAmount = centsToMoney(Math.min(
+      moneyToCents(availableWalletBalance),
+      moneyToCents(calc.totalAmount)
+    ));
   }
+  // A staged checkout has not created its payment yet. Keep a partial wallet
+  // payment at that same boundary, matching the original PaymentService flow.
+  const walletPaidAmount = deferProviderPayment
+    && moneyToCents(requestedWalletPaidAmount) > 0
+    && moneyToCents(requestedWalletPaidAmount) < moneyToCents(calc.totalAmount)
+    ? 0
+    : requestedWalletPaidAmount;
   const onlinePaidAmount = centsToMoney(moneyToCents(calc.totalAmount) - moneyToCents(walletPaidAmount));
   const resellerBaseAmount = resellerContext ? calc.items.reduce((sum, item) => sum + item.baseLineTotal, 0) : 0;
   const resellerPotentialProfit = resellerContext ? centsToMoney(moneyToCents(calc.totalAmount) - moneyToCents(resellerBaseAmount)) : 0;
@@ -4888,11 +4955,16 @@ async function apiGuestCreateOrder(
   const paymentExpireMinutes = requiresOnlinePayment ? await orderPaymentExpireMinutes(env) : 0;
   const expiresAt = requiresOnlinePayment ? new Date(Date.now() + paymentExpireMinutes * 60 * 1000).toISOString() : null;
   let orderId = 0;
-  const childOrders: Array<{ id: number; orderNo: string; item: CalculatedOrderItem; orderItemId: number }> = [];
+  const childOrders: Array<{
+    id: number;
+    orderNo: string;
+    item: CalculatedOrderItem;
+    orderItemId: number;
+    childResultIndex: number;
+    orderItemResultIndex: number;
+  }> = [];
   try {
-    let result: D1Result<unknown>;
-    try {
-      result = await env.DB.prepare(
+    const orderStatements: Array<ReturnType<D1Database["prepare"]>> = [env.DB.prepare(
     `INSERT INTO orders (
       order_no, user_id, guest_email, guest_password_salt, guest_password_hash, guest_locale, status, currency, original_amount,
       discount_amount, promotion_discount_amount, wholesale_discount_amount, member_discount_amount,
@@ -4929,18 +5001,7 @@ async function apiGuestCreateOrder(
     resellerContext ? resellerProfitStatus : "",
     expiresAt,
     requiresOnlinePayment ? null : now
-  ).run();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (checkoutRequestId && /unique constraint failed.*orders\.checkout_request_id/i.test(message)) {
-        const racedOrder = await checkoutOrderByRequestId(env, checkoutRequestId);
-        if (racedOrder && await checkoutOrderBelongsToBuyer(racedOrder, user, email, guestPassword)) {
-          return checkoutReplayResponse(env, racedOrder);
-        }
-      }
-      throw error;
-    }
-    orderId = Number(result.meta.last_row_id);
+  )];
     for (const [index, item] of calc.items.entries()) {
       const childOrderNo = `${orderNo}-${String(index + 1).padStart(2, "0")}`;
       const childTotal = centsToMoney(moneyToCents(item.lineTotal) - moneyToCents(item.couponDiscountAmount));
@@ -4949,7 +5010,8 @@ async function apiGuestCreateOrder(
         ? centsToMoney(moneyToCents(childTotal) - moneyToCents(childBaseAmount))
         : 0;
       const childProfitAmount = resellerContext && resellerRisk.eligible ? childPotentialProfit : 0;
-      const childResult = await env.DB.prepare(
+      const childResultIndex = orderStatements.length;
+      orderStatements.push(env.DB.prepare(
         `INSERT INTO orders (
           order_no, parent_id, user_id, guest_email, guest_password_salt, guest_password_hash, guest_locale,
           status, currency, original_amount, discount_amount, promotion_discount_amount,
@@ -4957,10 +5019,10 @@ async function apiGuestCreateOrder(
           online_paid_amount, coupon_code, client_ip, affiliate_code, affiliate_visitor_key,
           reseller_id, reseller_domain, reseller_base_amount, reseller_profit_amount, reseller_profit_status,
           expires_at, paid_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'CNY', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+        ) VALUES (?, (SELECT id FROM orders WHERE order_no=? AND parent_id IS NULL LIMIT 1), ?, ?, ?, ?, ?, ?, 'CNY', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
       ).bind(
         childOrderNo,
-        orderId,
+        orderNo,
         user?.id || 0,
         email,
         guestPasswordSalt,
@@ -4985,19 +5047,18 @@ async function apiGuestCreateOrder(
         resellerContext ? resellerProfitStatus : "",
         expiresAt,
         requiresOnlinePayment ? null : now
-      ).run();
-      const childOrderId = Number(childResult.meta.last_row_id);
-      childOrders.push({ id: childOrderId, orderNo: childOrderNo, item, orderItemId: 0 });
+      ));
       const productId = item.product.id;
-      const itemResult = await env.DB.prepare(
+      const orderItemResultIndex = orderStatements.length;
+      orderStatements.push(env.DB.prepare(
       `INSERT INTO order_items (
         order_id, product_id, sku_id, title_json, sku_snapshot_json, quantity,
         original_unit_price, unit_price, cost_price, original_total_price, total_price,
         coupon_discount_amount, promotion_discount_amount, wholesale_discount_amount, member_discount_amount,
         fulfillment_type, manual_form_schema_snapshot_json, manual_form_submission_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES ((SELECT id FROM orders WHERE order_no=? LIMIT 1), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
-      childOrderId,
+      childOrderNo,
       productId,
       item.sku.id,
       item.product.title_json,
@@ -5015,8 +5076,44 @@ async function apiGuestCreateOrder(
       calculatedFulfillmentType(item),
       JSON.stringify(item.manualFormSchemaSnapshot),
       JSON.stringify(item.manualFormSubmission)
-      ).run();
-      childOrders[childOrders.length - 1].orderItemId = Number(itemResult.meta.last_row_id || 0);
+      ));
+      if (calculatedFulfillmentType(item) === "manual") {
+        orderStatements.push(env.DB.prepare(
+          `INSERT INTO order_manual_stock_locks (order_id, sku_id, quantity, status)
+           VALUES ((SELECT id FROM orders WHERE order_no=? LIMIT 1), ?, ?, 'reserved')`
+        ).bind(childOrderNo, item.sku.id, item.quantity));
+      }
+      childOrders.push({
+        id: 0,
+        orderNo: childOrderNo,
+        item,
+        orderItemId: 0,
+        childResultIndex,
+        orderItemResultIndex
+      });
+    }
+    let orderResults: D1Result<unknown>[] = [];
+    try {
+      orderResults = await env.DB.batch(orderStatements);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (checkoutRequestId && /unique constraint failed.*orders\.checkout_request_id/i.test(message)) {
+        const racedOrder = await checkoutOrderByRequestId(env, checkoutRequestId);
+        if (racedOrder && await checkoutOrderBelongsToBuyer(racedOrder, user, email, guestPassword)) {
+          return checkoutReplayResponse(env, racedOrder);
+        }
+      }
+      if (message.includes("manual_stock_reserve_insufficient") || message.includes("manual_stock_reserve_invalid")) {
+        throw new ApiRequestError(409, "人工库存不足，请刷新后重试");
+      }
+      throw error;
+    }
+    orderId = Number(orderResults[0]?.meta.last_row_id || 0);
+    if (orderId <= 0) throw new ApiRequestError(500, "订单创建失败");
+    for (const child of childOrders) {
+      child.id = Number(orderResults[child.childResultIndex]?.meta.last_row_id || 0);
+      child.orderItemId = Number(orderResults[child.orderItemResultIndex]?.meta.last_row_id || 0);
+      if (child.id <= 0 || child.orderItemId <= 0) throw new ApiRequestError(500, "订单明细创建失败");
     }
     if (resellerContext) {
       await createResellerOrderSnapshot(env, {
@@ -5032,13 +5129,12 @@ async function apiGuestCreateOrder(
       });
     }
     for (const child of childOrders) {
-      if (!await reserveManualStockForOrder(env, child.id)) {
-        throw new ApiRequestError(409, "人工库存不足，请刷新后重试");
-      }
       const item = child.item;
-      if (calculatedFulfillmentType(item) !== "auto") continue;
-      const reserved = await reserveCardSecretsForOrder(env, child.id, item.product, item.sku, item.quantity);
-      if (reserved.length !== item.quantity) throw new ApiRequestError(409, "自动发货卡密库存不足，请刷新后重试");
+      const fulfillmentType = calculatedFulfillmentType(item);
+      if (fulfillmentType === "auto") {
+        const reserved = await reserveFreshCardSecretsForOrder(env, child.id, item.product, item.sku, item.quantity);
+        if (reserved.length !== item.quantity) throw new ApiRequestError(409, "自动发货卡密库存不足，请刷新后重试");
+      }
     }
     if (calc.coupon) await recordCouponUsage(env, calc.coupon, orderId, email, user?.id || 0);
     if (user && walletPaidAmount > 0) {
@@ -5063,12 +5159,10 @@ async function apiGuestCreateOrder(
     throw error;
   }
 
-  const requestedChannelId = toInt(body.channel_id, 0);
-  const deferProviderPayment = createAndPay && body.defer_payment === true;
   if (requiresOnlinePayment && (!createAndPay || requestedChannelId <= 0 || deferProviderPayment)) {
-    const pendingOrder = await env.DB.prepare("SELECT * FROM orders WHERE id=?").bind(orderId).first<OrderRow>();
+    const pendingOrder = await hydrateRootOrderById(env, orderId);
     return apiOk({
-      order: pendingOrder ? await hydrateOrder(env, pendingOrder) : null,
+      order: pendingOrder,
       order_no: orderNo,
       order_status: "pending_payment",
       status: "pending_payment",
@@ -5085,7 +5179,7 @@ async function apiGuestCreateOrder(
     let paymentError = "";
     try {
       payment = pendingOrder
-        ? await createOrReturnOrderPayment(env, pendingOrder, requestedChannelId, body.use_balance === true)
+        ? await createOrReturnOrderPayment(env, pendingOrder, requestedChannelId, body.use_balance === true, user || null)
         : null;
     } catch (error) {
       await releaseOrderWalletBalance(env, orderId, "在线支付创建失败，退回余额");
@@ -5319,6 +5413,7 @@ async function submitProcurementOrderToUpstream(env: Env, procurementOrderId: nu
 async function runScheduledMaintenance(env: Env): Promise<void> {
   const tasks: Array<[string, () => Promise<unknown>]> = [
     ["expired_orders", () => cancelExpiredPendingOrders(env)],
+    ["expired_wallet_recharges", () => expireDueWalletRecharges(env)],
     ["paid_order_finalization_recovery", () => retryIncompletePaidOrderFinalizations(env)],
     ["rate_limit_cleanup", () => env.DB.prepare("DELETE FROM rate_limit_counters WHERE updated_at < ?")
       .bind(Math.floor(Date.now() / 1000) - 2 * 24 * 60 * 60)
@@ -5505,14 +5600,25 @@ async function calculatedOrderItemsFromStoredItems(
   env: Env,
   storedItems: Array<OrderItemRow & AnyRecord>
 ): Promise<CalculatedOrderItem[]> {
+  const productIds = Array.from(new Set(storedItems.map((item) => Number(item.product_id || 0)).filter((id) => id > 0)));
+  const skuIds = Array.from(new Set(storedItems.map((item) => Number(item.sku_id || 0)).filter((id) => id > 0)));
+  if (!productIds.length || !skuIds.length) return [];
+  const productPlaceholders = productIds.map(() => "?").join(",");
+  const skuPlaceholders = skuIds.map(() => "?").join(",");
+  const [productsResult, skusResult] = await env.DB.batch([
+    env.DB.prepare(`SELECT * FROM products WHERE id IN (${productPlaceholders})`).bind(...productIds),
+    env.DB.prepare(`SELECT * FROM product_skus WHERE id IN (${skuPlaceholders})`).bind(...skuIds)
+  ]);
+  const productsById = new Map(
+    ((productsResult.results || []) as ProductRow[]).map((row) => [Number(row.id), row])
+  );
+  const skusById = new Map(
+    ((skusResult.results || []) as SkuRow[]).map((row) => [Number(row.id), row])
+  );
   const items: CalculatedOrderItem[] = [];
   for (const stored of storedItems) {
-    const product = await env.DB.prepare("SELECT * FROM products WHERE id=?")
-      .bind(stored.product_id)
-      .first<ProductRow>();
-    const sku = await env.DB.prepare("SELECT * FROM product_skus WHERE id=?")
-      .bind(stored.sku_id)
-      .first<SkuRow>();
+    const product = productsById.get(Number(stored.product_id || 0));
+    const sku = skusById.get(Number(stored.sku_id || 0));
     if (!product || !sku) continue;
     const quantity = Math.max(0, Number(stored.quantity || 0));
     items.push({
@@ -5636,7 +5742,7 @@ async function apiGuestOrders(request: Request, env: Env, url: URL): Promise<Res
   }
   const total = visibleRows.length;
   const pageRows = visibleRows.slice(offset, offset + size);
-  const orders = await Promise.all(pageRows.map((row) => hydrateOrder(env, row)));
+  const orders = await hydrateRootOrders(env, pageRows);
   return apiOk(orders, pagination(page, size, total));
 }
 
@@ -5666,7 +5772,7 @@ async function apiGuestCreatePayment(request: Request, env: Env): Promise<Respon
   const body = await readJson(request);
   const order = await guestOrderFromPaymentPayload(request, env, body);
   if (!order.ok) return apiError(order.error, order.status);
-  return apiOk(await createOrReturnOrderPayment(env, order.order, toInt(body.channel_id, 0), false));
+  return apiOk(await createOrReturnOrderPayment(env, order.order, toInt(body.channel_id, 0), false, null));
 }
 
 async function apiGuestLatestPayment(request: Request, env: Env, url: URL): Promise<Response> {
@@ -5702,7 +5808,7 @@ async function apiUserCreatePayment(request: Request, env: Env, user: UserRow): 
     .bind(orderNo, user.id, ...scope.params)
     .first<OrderRow>();
   if (!order) return apiError("订单不存在", 404);
-  return apiOk(await createOrReturnOrderPayment(env, order, toInt(body.channel_id, 0), body.use_balance === true));
+  return apiOk(await createOrReturnOrderPayment(env, order, toInt(body.channel_id, 0), body.use_balance === true, user));
 }
 
 async function apiUserLatestPayment(request: Request, env: Env, url: URL, user: UserRow): Promise<Response> {
@@ -5765,13 +5871,13 @@ async function createOrReturnOrderPayment(
   env: Env,
   order: OrderRow,
   channelId: number,
-  useBalance = false
+  useBalance = false,
+  authenticatedUser: UserRow | null = null
 ): Promise<AnyRecord> {
   if (order.parent_id != null) throw new ApiRequestError(400, "子订单不能单独发起支付");
-  order = await env.DB.prepare("SELECT * FROM orders WHERE id=?").bind(order.id).first<OrderRow>() || order;
   const expiresAt = order.expires_at ? new Date(order.expires_at).getTime() : 0;
   if (order.status === "pending_payment" && expiresAt > 0 && expiresAt <= Date.now()) {
-    await cancelExpiredPendingOrders(env);
+    await cancelExpiredPendingOrder(env, order.id);
     order = await env.DB.prepare("SELECT * FROM orders WHERE id=?").bind(order.id).first<OrderRow>() || order;
   }
   if (order.status !== "pending_payment") {
@@ -5790,6 +5896,27 @@ async function createOrReturnOrderPayment(
       pay_url: "",
       qr_code: ""
     };
+  }
+
+  let channel: PaymentChannelRow | null = null;
+  let existing: PaymentRow | null = null;
+  let orderProducts: ProductRow[] = [];
+  if (channelId > 0) {
+    [channel, existing, orderProducts] = await paymentChannelAndReusablePayment(env, order.id, channelId);
+    if (!channel) throw new ApiRequestError(404, "支付渠道不存在");
+    if (existing) {
+      const existingProviderType = clean(existing.provider_type, 40).toLowerCase();
+      const missingPaymentTarget = !clean(existing.pay_url, 1000) && !clean(existing.qr_code, 2000);
+      if (isImplementedPaymentProvider(existingProviderType, existing.channel_type) && missingPaymentTarget) {
+        const prepared = await prepareProviderOrderPayment(env, existing, order, channel);
+        if (!prepared.ok) {
+          await failOrderPaymentCreation(env, existing, order, prepared.error);
+          throw new ApiRequestError(400, prepared.error);
+        }
+        return formatPaymentCreateResult(prepared.payment, order);
+      }
+      return formatPaymentCreateResult(existing, order);
+    }
   }
 
   if (order.user_id) {
@@ -5822,27 +5949,18 @@ async function createOrReturnOrderPayment(
   }
 
   if (channelId <= 0) throw new ApiRequestError(400, "请选择支付方式");
-  const channel = await paymentChannelById(env, channelId);
   if (!channel) throw new ApiRequestError(404, "支付渠道不存在");
-  const validationError = await validatePaymentChannelForOrder(env, channel, order, amount);
+  const validationError = await validatePaymentChannelForOrder(
+    env,
+    channel,
+    order,
+    amount,
+    authenticatedUser,
+    orderProducts
+  );
   if (validationError) throw new ApiRequestError(400, validationError);
 
-  const existing = await reusablePaymentForOrderChannel(env, order.id, channel.id);
-  if (existing) {
-    const existingProviderType = clean(existing.provider_type, 40).toLowerCase();
-    const missingPaymentTarget = !clean(existing.pay_url, 1000) && !clean(existing.qr_code, 2000);
-    if (isImplementedPaymentProvider(existingProviderType, existing.channel_type) && missingPaymentTarget) {
-      const prepared = await prepareProviderOrderPayment(env, existing, order, channel);
-      if (!prepared.ok) {
-        await failOrderPaymentCreation(env, existing, order, prepared.error);
-        throw new ApiRequestError(400, prepared.error);
-      }
-      return formatPaymentCreateResult(prepared.payment, order);
-    }
-    return formatPaymentCreateResult(existing, order);
-  }
-
-  const payment = await createManualPaymentForOrder(env, {
+  let payment = await createManualPaymentForOrder(env, {
     orderId: order.id,
     orderNo: order.order_no,
     userId: order.user_id || 0,
@@ -5853,6 +5971,10 @@ async function createOrReturnOrderPayment(
     status: "pending",
     paidAt: null
   });
+  if (!payment) {
+    payment = await reusablePaymentForOrderChannel(env, order.id, channelId);
+    if (!payment) throw new ApiRequestError(409, "支付正在创建，请稍后重试");
+  }
   const hydrated = payment ? { ...payment, order_no: order.order_no, channel_name: channel.name } : null;
   if (hydrated && clean(hydrated.provider_type, 40).toLowerCase() !== "manual") {
     const prepared = await prepareProviderOrderPayment(env, hydrated, order, channel);
@@ -5906,7 +6028,7 @@ async function captureOrderPayment(env: Env, payment: PaymentRow, order: OrderRo
   return apiOk(formatPaymentCreateResult(freshPayment, freshOrder));
 }
 
-async function markOrderPaid(env: Env, orderId: number): Promise<boolean> {
+async function markOrderPaid(env: Env, orderId: number, ctx?: ExecutionContext): Promise<boolean> {
   const result = await env.DB.prepare(
     "UPDATE orders SET status='paid', paid_at=COALESCE(paid_at, CURRENT_TIMESTAMP), updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending_payment'"
   ).bind(orderId).run();
@@ -5915,7 +6037,7 @@ async function markOrderPaid(env: Env, orderId: number): Promise<boolean> {
     return false;
   }
   if (order.status !== "refunded") {
-    await finalizePaidOrder(env, orderId);
+    await finalizePaidOrder(env, orderId, ctx);
   }
   return Number(result.meta.changes || 0) > 0 || Boolean(order.paid_at);
 }
@@ -5932,7 +6054,44 @@ async function latestPaymentForOrder(env: Env, orderId: number): Promise<Payment
   ).bind(orderId).first<PaymentRow>();
 }
 
-async function reusablePaymentForOrderChannel(env: Env, orderId: number, channelId: number): Promise<PaymentRow | null> {
+async function paymentChannelAndReusablePayment(
+  env: Env,
+  orderId: number,
+  channelId: number
+): Promise<[PaymentChannelRow | null, PaymentRow | null, ProductRow[]]> {
+  const [channelResult, paymentResult, productsResult] = await env.DB.batch([
+    env.DB.prepare("SELECT * FROM payment_channels WHERE id=?").bind(channelId),
+    env.DB.prepare(
+      `SELECT p.*, o.order_no AS order_no, pc.name AS channel_name
+       FROM payments p
+       LEFT JOIN orders o ON o.id=p.order_id
+       LEFT JOIN payment_channels pc ON pc.id=p.channel_id
+       WHERE p.order_id=? AND p.channel_id=?
+         AND p.status IN ('initiated','pending','created')
+         AND (p.expired_at IS NULL OR p.expired_at > CURRENT_TIMESTAMP)
+       ORDER BY p.id DESC
+       LIMIT 1`
+    ).bind(orderId, channelId),
+    env.DB.prepare(
+      `SELECT DISTINCT p.*
+       FROM order_items oi
+       JOIN orders item_order ON item_order.id=oi.order_id
+       JOIN products p ON p.id=oi.product_id
+       WHERE item_order.id=? OR item_order.parent_id=?`
+    ).bind(orderId, orderId)
+  ]);
+  return [
+    (channelResult.results?.[0] as PaymentChannelRow | undefined) || null,
+    (paymentResult.results?.[0] as PaymentRow | undefined) || null,
+    (productsResult.results || []) as ProductRow[]
+  ];
+}
+
+async function reusablePaymentForOrderChannel(
+  env: Env,
+  orderId: number,
+  channelId: number
+): Promise<PaymentRow | null> {
   return env.DB.prepare(
     `SELECT p.*, o.order_no AS order_no, pc.name AS channel_name
      FROM payments p
@@ -7601,7 +7760,7 @@ function verifyQueriedPaymentAgainstRecord(
   };
 }
 
-async function apiPaymentCallback(request: Request, env: Env, url: URL): Promise<Response> {
+async function apiPaymentCallback(request: Request, env: Env, url: URL, ctx?: ExecutionContext): Promise<Response> {
   if (isWechatPaymentCallbackRequest(request)) return apiWechatPaymentCallback(request, env, url);
   const callback = await readPaymentCallback(request, url);
   const paymentNo = clean(
@@ -7632,7 +7791,7 @@ async function apiPaymentCallback(request: Request, env: Env, url: URL): Promise
   if (!decimalStringsEqual(verified.amount, expectedAmount, 8)) return new Response("fail", { status: 400 });
   if (verified.currency && verified.currency.toUpperCase() !== expectedCurrency) return new Response("fail", { status: 400 });
 
-  await applyVerifiedPaymentCallback(env, payment, verified);
+  await applyVerifiedPaymentCallback(env, payment, verified, ctx);
   return paymentCallbackSuccessResponse();
 }
 
@@ -7902,7 +8061,8 @@ function decimalStringsEqual(left: unknown, right: unknown, scale: number): bool
 async function applyVerifiedPaymentCallback(
   env: Env,
   payment: PaymentRow,
-  callback: Extract<VerifiedPaymentCallback, { ok: true }>
+  callback: Extract<VerifiedPaymentCallback, { ok: true }>,
+  ctx?: ExecutionContext
 ): Promise<void> {
   const previousPayload = jsonObject(jsonParse(payment.provider_payload_json || "{}", {}));
   const payload = {
@@ -7919,7 +8079,7 @@ async function applyVerifiedPaymentCallback(
       await applyWalletRechargeSuccess(env, payment, recharge, payload);
       return;
     }
-    if (!await markOrderPaid(env, payment.order_id)) throw new ApiRequestError(409, "订单状态不能更新为已支付");
+    if (!await markOrderPaid(env, payment.order_id, ctx)) throw new ApiRequestError(409, "订单状态不能更新为已支付");
     await env.DB.prepare(
       `UPDATE payments
        SET status='success', provider_trade_no=COALESCE(NULLIF(?, ''), provider_trade_no),
@@ -8610,6 +8770,25 @@ async function finalizeSinglePaidOrder(env: Env, order: OrderRow): Promise<{
   const storedItems = items.results || [];
   let hasManualItems = false;
   const autoSecrets: Array<{ product: ProductRow; sku: SkuRow; secret: CardSecretRow }> = [];
+  const autoItems = storedItems.filter((item) => (clean(item.fulfillment_type, 40) || "manual") === "auto");
+  const productIds = Array.from(new Set(autoItems.map((item) => Number(item.product_id || 0)).filter((id) => id > 0)));
+  const skuIds = Array.from(new Set(autoItems.map((item) => Number(item.sku_id || 0)).filter((id) => id > 0)));
+  let productsById = new Map<number, ProductRow>();
+  let skusById = new Map<number, SkuRow>();
+  if (productIds.length && skuIds.length) {
+    const productPlaceholders = productIds.map(() => "?").join(",");
+    const skuPlaceholders = skuIds.map(() => "?").join(",");
+    const [productsResult, skusResult] = await env.DB.batch([
+      env.DB.prepare(`SELECT * FROM products WHERE id IN (${productPlaceholders})`).bind(...productIds),
+      env.DB.prepare(`SELECT * FROM product_skus WHERE id IN (${skuPlaceholders})`).bind(...skuIds)
+    ]);
+    productsById = new Map(
+      ((productsResult.results || []) as ProductRow[]).map((row) => [Number(row.id), row])
+    );
+    skusById = new Map(
+      ((skusResult.results || []) as SkuRow[]).map((row) => [Number(row.id), row])
+    );
+  }
   for (const item of storedItems) {
     const fulfillmentType = clean(item.fulfillment_type, 40) || "manual";
     if (fulfillmentType === "upstream") continue;
@@ -8617,8 +8796,8 @@ async function finalizeSinglePaidOrder(env: Env, order: OrderRow): Promise<{
       hasManualItems = true;
       continue;
     }
-    const product = await env.DB.prepare("SELECT * FROM products WHERE id=?").bind(item.product_id).first<ProductRow>();
-    const sku = await env.DB.prepare("SELECT * FROM product_skus WHERE id=?").bind(item.sku_id).first<SkuRow>();
+    const product = productsById.get(Number(item.product_id || 0));
+    const sku = skusById.get(Number(item.sku_id || 0));
     if (!product || !sku) continue;
     const consumed = await consumeCardSecretsForOrder(env, order.id, product, sku, Number(item.quantity || 0));
     if (consumed.length !== Number(item.quantity || 0)) continue;
@@ -8685,21 +8864,20 @@ async function finalizePaidOrder(env: Env, orderId: number, ctx?: ExecutionConte
     await updateUserMemberLevelForThresholds(env, order.user_id);
   }
 
-  const childRows = order.parent_id == null
-    ? await env.DB.prepare("SELECT * FROM orders WHERE parent_id=? ORDER BY id ASC").bind(order.id).all<OrderRow>()
-    : { results: [] as OrderRow[] };
-  const children = childRows.results || [];
-  if (children.length) {
-    await env.DB.prepare(
-      `UPDATE orders
-       SET status='paid', paid_at=COALESCE(paid_at, ?), updated_at=CURRENT_TIMESTAMP
-       WHERE parent_id=? AND status='pending_payment'`
-    ).bind(order.paid_at || new Date().toISOString(), order.id).run();
+  let children: OrderRow[] = [];
+  if (order.parent_id == null) {
+    const childResults = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE orders
+         SET status='paid', paid_at=COALESCE(paid_at, ?), updated_at=CURRENT_TIMESTAMP
+         WHERE parent_id=? AND status='pending_payment'`
+      ).bind(order.paid_at || new Date().toISOString(), order.id),
+      env.DB.prepare("SELECT * FROM orders WHERE parent_id=? ORDER BY id ASC").bind(order.id)
+    ]);
+    children = (childResults[1].results || []) as OrderRow[];
   }
 
-  const targets = children.length
-    ? (await env.DB.prepare("SELECT * FROM orders WHERE parent_id=? ORDER BY id ASC").bind(order.id).all<OrderRow>()).results || []
-    : [order];
+  const targets = children.length ? children : [order];
   const storedItems: Array<OrderItemRow & AnyRecord> = [];
   let hasManualItems = false;
   for (const target of targets) {
@@ -9163,12 +9341,35 @@ async function apiUserOrderPaymentChannels(request: Request, env: Env, user: Use
   const body = await readJson(request);
   const amount = centsToMoney(moneyToCents(Number(body.amount || 0)));
   if (amount <= 0) return apiOk([]);
-  const productIds = Array.from(new Set(
-    (Array.isArray(body.items) ? body.items : [])
-      .map((item: AnyRecord) => toInt(item?.product_id, 0))
-      .filter((id: number) => id > 0)
-  ));
-  const products = await productRowsByIds(env, productIds);
+  const orderNo = clean(body.order_no, 80);
+  let products: ProductRow[];
+  if (orderNo) {
+    const scope = await storefrontOrderScope(request, env, "root.reseller_id");
+    const [orderResult, productResult] = await env.DB.batch([
+      env.DB.prepare(
+        `SELECT root.id FROM orders root
+         WHERE root.order_no=? AND root.user_id=? AND root.parent_id IS NULL AND ${scope.sql}
+         LIMIT 1`
+      ).bind(orderNo, user.id, ...scope.params),
+      env.DB.prepare(
+        `SELECT DISTINCT p.*
+         FROM orders root
+         JOIN orders item_order ON item_order.id=root.id OR item_order.parent_id=root.id
+         JOIN order_items oi ON oi.order_id=item_order.id
+         JOIN products p ON p.id=oi.product_id
+         WHERE root.order_no=? AND root.user_id=? AND root.parent_id IS NULL AND ${scope.sql}`
+      ).bind(orderNo, user.id, ...scope.params)
+    ]);
+    if (!orderResult.results?.length) return apiError("订单不存在", 404);
+    products = (productResult.results || []) as ProductRow[];
+  } else {
+    const productIds = Array.from(new Set(
+      (Array.isArray(body.items) ? body.items : [])
+        .map((item: AnyRecord) => toInt(item?.product_id, 0))
+        .filter((id: number) => id > 0)
+    ));
+    products = await productRowsByIds(env, productIds);
+  }
   const channels = await availableOrderPaymentChannels(env, products, amount, user);
   return apiOk(channels.map(formatPublicPaymentChannel));
 }
@@ -9192,7 +9393,6 @@ async function apiUserWalletRecharge(request: Request, env: Env, user: UserRow):
 }
 
 async function apiUserWalletRecharges(env: Env, url: URL, userId: number): Promise<Response> {
-  await expireDueWalletRecharges(env);
   const { page, size, offset } = paging(url);
   const params: unknown[] = [userId];
   let where = "WHERE user_id=?";
@@ -9214,7 +9414,6 @@ async function apiUserWalletRecharges(env: Env, url: URL, userId: number): Promi
 }
 
 async function apiUserWalletRechargeStats(env: Env, url: URL, userId: number): Promise<Response> {
-  await expireDueWalletRecharges(env);
   const params: unknown[] = [userId];
   let where = "WHERE user_id=?";
   const rechargeNo = clean(url.searchParams.get("recharge_no"), 80);
@@ -9231,18 +9430,18 @@ async function apiUserWalletRechargeStats(env: Env, url: URL, userId: number): P
 }
 
 async function apiUserWalletRechargeDetail(env: Env, userId: number, rechargeNo: string): Promise<Response> {
-  await expireDueWalletRecharges(env);
-  const recharge = await getWalletRechargeByNo(env, rechargeNo, userId);
+  let recharge = await getWalletRechargeByNo(env, rechargeNo, userId);
   if (!recharge) return apiError("充值订单不存在", 404);
+  recharge = await expireWalletRechargeIfDue(env, recharge);
   const payment = recharge.payment_id ? await paymentByIdWithContext(env, recharge.payment_id) : null;
   return apiOk(formatWalletRechargePaymentPayload(recharge, payment, await ensureWallet(env, userId)));
 }
 
 async function apiUserCaptureWalletRechargePayment(env: Env, user: UserRow, paymentId: number): Promise<Response> {
   if (!Number.isFinite(paymentId) || paymentId <= 0) return apiError("支付记录不存在", 404);
-  await expireDueWalletRecharges(env);
-  const recharge = await getWalletRechargeByPaymentId(env, paymentId, user.id);
+  let recharge = await getWalletRechargeByPaymentId(env, paymentId, user.id);
   if (!recharge) return apiError("充值订单不存在", 404);
+  recharge = await expireWalletRechargeIfDue(env, recharge);
   let payment = await paymentByIdWithContext(env, paymentId);
   if (!payment) return apiError("支付记录不存在", 404);
   if (payment.status !== "success" && ["official:stripe", "official:paypal", "official:wechat"].includes(paymentProviderKey(payment.provider_type, payment.channel_type))) {
@@ -9364,7 +9563,7 @@ async function apiUserOrders(request: Request, env: Env, url: URL, userId: numbe
   const rows = await env.DB.prepare(
     `SELECT * FROM orders ${where} ORDER BY id DESC LIMIT ? OFFSET ?`
   ).bind(...params, size, offset).all<OrderRow>();
-  const orders = await Promise.all((rows.results || []).map((row) => hydrateOrder(env, row)));
+  const orders = await hydrateRootOrders(env, rows.results || []);
   return apiOk(orders, pagination(page, size, total));
 }
 
@@ -12712,7 +12911,6 @@ async function apiAdminUserCouponUsages(env: Env, url: URL, userId: number): Pro
 }
 
 async function apiAdminWalletRecharges(env: Env, url: URL): Promise<Response> {
-  await expireDueWalletRecharges(env);
   const { page, size, offset } = paging(url);
   const params: unknown[] = [];
   let where = "WHERE 1=1";
@@ -14727,7 +14925,6 @@ function parseStoredDate(value: unknown): Date {
 }
 
 async function apiDashboardOverview(env: Env, url: URL): Promise<Response> {
-  await cancelExpiredPendingOrders(env);
   const range = dashboardRangeFromUrl(url);
   const config = await dashboardConfig(env);
   const inventory = await dashboardInventory(env, config.alert.low_stock_threshold);
@@ -14840,7 +15037,6 @@ async function apiDashboardOverview(env: Env, url: URL): Promise<Response> {
 }
 
 async function apiDashboardTrends(env: Env, url: URL): Promise<Response> {
-  await cancelExpiredPendingOrders(env);
   const range = dashboardRangeFromUrl(url);
   const orderRows = await env.DB.prepare(
     `SELECT o.id, o.created_at, o.status, o.total_amount,
@@ -14920,7 +15116,6 @@ async function apiDashboardTrends(env: Env, url: URL): Promise<Response> {
 }
 
 async function apiDashboardRankings(env: Env, url: URL): Promise<Response> {
-  await cancelExpiredPendingOrders(env);
   const range = dashboardRangeFromUrl(url);
   const config = await dashboardConfig(env);
   const productRows = await env.DB.prepare(
@@ -15816,7 +16011,6 @@ async function saveBanner(env: Env, body: AnyRecord, id?: number): Promise<numbe
 }
 
 async function apiAdminProducts(env: Env, url: URL): Promise<Response> {
-  await cancelExpiredPendingOrders(env);
   const { page, size, offset } = paging(url);
   const search = clean(url.searchParams.get("search"), 120);
   const fulfillmentType = clean(url.searchParams.get("fulfillment_type"), 20);
@@ -16578,7 +16772,6 @@ async function apiAdminExportGiftCards(request: Request, env: Env): Promise<Resp
 }
 
 async function apiAdminOrders(env: Env, url: URL): Promise<Response> {
-  await cancelExpiredPendingOrders(env);
   const { page, size, offset } = paging(url);
   const params: unknown[] = [];
   let where = "WHERE o.parent_id IS NULL";
@@ -16653,7 +16846,7 @@ async function apiAdminOrders(env: Env, url: URL): Promise<Response> {
      ${where}
      ORDER BY ${sortBy} ${sortOrder}, o.id DESC LIMIT ? OFFSET ?`
   ).bind(...params, size, offset).all<OrderRow>();
-  const orders = await Promise.all((rows.results || []).map((row) => hydrateOrder(env, row, { includeCost: true })));
+  const orders = await hydrateRootOrders(env, rows.results || [], { includeCost: true });
   return apiOk(orders, pagination(page, size, total));
 }
 
@@ -17022,31 +17215,81 @@ async function calculateOrder(env: Env, body: AnyRecord, resellerContext?: Resel
     if (productId > 0) productQuantityTotals.set(productId, (productQuantityTotals.get(productId) || 0) + quantity);
   }
   const userMemberLevelId = resellerContext ? 0 : Number(user?.member_level_id || 0);
+  const productIds = Array.from(productQuantityTotals.keys());
+  const placeholders = productIds.map(() => "?").join(",");
+  const now = new Date().toISOString();
+  const [productsResult, skusResult, mappingsResult, cardStockResult, promotionsResult, memberLevelResult, memberPricesResult] = await env.DB.batch([
+    env.DB.prepare(`SELECT * FROM products WHERE id IN (${placeholders}) AND is_active=1`).bind(...productIds),
+    env.DB.prepare(
+      `SELECT * FROM product_skus WHERE product_id IN (${placeholders}) AND is_active=1
+       ORDER BY product_id ASC, sort_order ASC, id ASC`
+    ).bind(...productIds),
+    env.DB.prepare(
+      `SELECT DISTINCT pm.local_product_id AS product_id, COALESCE(pms.local_sku_id, 0) AS sku_id
+       FROM product_mappings pm
+       LEFT JOIN product_mapping_skus pms ON pms.mapping_id=pm.id
+       WHERE pm.local_product_id IN (${placeholders}) AND pm.is_active=1`
+    ).bind(...productIds),
+    env.DB.prepare(
+      `SELECT product_id, sku_id, COUNT(*) AS count
+       FROM card_secrets
+       WHERE product_id IN (${placeholders}) AND status='available'
+       GROUP BY product_id, sku_id`
+    ).bind(...productIds),
+    env.DB.prepare(
+      `SELECT * FROM promotions
+       WHERE is_active=1 AND scope_type='product' AND scope_ref_id IN (${placeholders})
+         AND (starts_at IS NULL OR starts_at='' OR starts_at<=?)
+         AND (ends_at IS NULL OR ends_at='' OR ends_at>=?)
+       ORDER BY scope_ref_id ASC, min_amount ASC, id ASC`
+    ).bind(...productIds, now, now),
+    env.DB.prepare("SELECT * FROM member_levels WHERE id=? AND is_active=1").bind(userMemberLevelId),
+    env.DB.prepare(
+      `SELECT * FROM member_level_prices
+       WHERE member_level_id=? AND product_id IN (${placeholders})
+       ORDER BY product_id ASC, sku_id DESC, id ASC`
+    ).bind(userMemberLevelId, ...productIds)
+  ]);
+  const productsById = new Map(((productsResult.results || []) as ProductRow[]).map((row) => [Number(row.id), row]));
+  const skusByProduct = groupRowsByNumber((skusResult.results || []) as SkuRow[], (row) => row.product_id);
+  const upstreamMappings = groupRowsByNumber(
+    (mappingsResult.results || []) as Array<{ product_id: number; sku_id: number }>,
+    (row) => row.product_id
+  );
+  const cardStock = new Map(
+    ((cardStockResult.results || []) as Array<{ product_id: number; sku_id: number; count: number }>)
+      .map((row) => [`${Number(row.product_id)}:${Number(row.sku_id)}`, Number(row.count || 0)] as const)
+  );
+  const promotionsByProduct = groupRowsByNumber((promotionsResult.results || []) as PromotionRow[], (row) => row.scope_ref_id);
+  const memberLevel = ((memberLevelResult.results || []) as MemberLevelRow[])[0] || null;
+  const memberPricesByProduct = groupRowsByNumber(
+    (memberPricesResult.results || []) as MemberLevelPriceRow[],
+    (row) => row.product_id
+  );
 
   for (const raw of items) {
     const productId = toInt(raw.product_id, 0);
     const skuId = toInt(raw.sku_id, 0);
     const quantity = toInt(raw.quantity, 0);
-    const product = await env.DB.prepare("SELECT * FROM products WHERE id=? AND is_active=1").bind(productId).first<ProductRow>();
+    const product = productsById.get(productId) || null;
+    const productSkus = skusByProduct.get(productId) || [];
+    const sku = skuId ? (productSkus.find((row) => row.id === skuId) || null) : (productSkus[0] || null);
     if (!product) return { ok: false, error: "商品不存在或已下架" };
     if (!user && !resellerContext && (clean(product.purchase_type, 20) || "member") === "member") {
       return { ok: false, error: "该商品仅限登录会员购买" };
     }
-    const sku = skuId
-      ? await env.DB.prepare("SELECT * FROM product_skus WHERE id=? AND product_id=? AND is_active=1").bind(skuId, productId).first<SkuRow>()
-      : await env.DB.prepare("SELECT * FROM product_skus WHERE product_id=? AND is_active=1 ORDER BY sort_order ASC, id ASC").bind(productId).first<SkuRow>();
     if (!sku) return { ok: false, error: "商品规格不存在或已下架" };
     if (quantity < Math.max(1, product.min_purchase_quantity || 1)) return { ok: false, error: "购买数量低于最低限制" };
     if (product.max_purchase_quantity > 0 && quantity > product.max_purchase_quantity) return { ok: false, error: "购买数量超过限制" };
     const fulfillmentType = clean(product.fulfillment_type, 40) || "manual";
     const usesUpstreamStock = fulfillmentType === "upstream"
-      ? await productHasActiveUpstreamMapping(env, product.id, sku.id)
+      ? (upstreamMappings.get(product.id) || []).some((row) => Number(row.sku_id || 0) === 0 || Number(row.sku_id) === sku.id)
       : false;
     if (fulfillmentType === "upstream" && !usesUpstreamStock) {
       return { ok: false, error: "上游商品映射不存在或已停用" };
     }
     if (fulfillmentType === "auto") {
-      const availableSecrets = await availableCardSecretCount(env, product.id, sku.id);
+      const availableSecrets = cardStock.get(`${product.id}:${sku.id}`) || 0;
       if (availableSecrets < quantity) return { ok: false, error: "自动发货卡密库存不足" };
     } else if (fulfillmentType === "manual" && !hasStock(sku, quantity)) {
       return { ok: false, error: "人工库存不足" };
@@ -17076,7 +17319,7 @@ async function calculateOrder(env: Env, body: AnyRecord, resellerContext?: Resel
     let memberDiscount = 0;
 
     if (!resellerContext) {
-      const promotion = await resolvePromotionUnitPrice(env, product.id, baseUnitPrice, quantity);
+      const promotion = resolvePromotionUnitPriceFromRows(promotionsByProduct.get(product.id) || [], baseUnitPrice, quantity);
       let promotionUnitPrice = promotion.unitPrice;
       if (promotionUnitPrice < baseUnitPrice) {
         promotionDiscount = centsToMoney((moneyToCents(baseUnitPrice) - moneyToCents(promotionUnitPrice)) * quantity);
@@ -17099,7 +17342,7 @@ async function calculateOrder(env: Env, body: AnyRecord, resellerContext?: Resel
         wholesaleDiscount = 0;
       }
 
-      const member = await resolveMemberUnitPrice(env, userMemberLevelId, product.id, sku.id, unitPrice);
+      const member = resolveMemberUnitPriceFromRows(memberLevel, memberPricesByProduct.get(product.id) || [], sku.id, unitPrice);
       if (member.unitPrice < unitPrice) {
         memberDiscount = centsToMoney((moneyToCents(unitPrice) - moneyToCents(member.unitPrice)) * quantity);
         unitPrice = member.unitPrice;
@@ -17535,9 +17778,19 @@ async function resolvePromotionUnitPrice(
        AND (ends_at IS NULL OR ends_at='' OR ends_at>=?)
      ORDER BY min_amount ASC, id ASC`
   ).bind(productId, now, now).all<PromotionRow>();
+  return resolvePromotionUnitPriceFromRows(rows.results || [], baseUnitPrice, quantity);
+}
+
+function resolvePromotionUnitPriceFromRows(
+  rows: PromotionRow[],
+  baseUnitPrice: number,
+  quantity: number
+): { unitPrice: number; promotion: PromotionRow | null } {
+  const baseCents = moneyToCents(baseUnitPrice);
+  if (baseCents <= 0 || quantity <= 0) return { unitPrice: centsToMoney(baseCents), promotion: null };
   const subtotal = centsToMoney(baseCents * quantity);
   let matched: PromotionRow | null = null;
-  for (const row of rows.results || []) {
+  for (const row of rows) {
     if (Number(row.min_amount || 0) <= 0 || subtotal >= Number(row.min_amount || 0)) {
       matched = row;
     }
@@ -17579,7 +17832,24 @@ async function resolveMemberUnitPrice(
      WHERE member_level_id=? AND product_id=? AND sku_id IN (?, 0)
      ORDER BY CASE WHEN sku_id=? THEN 0 ELSE 1 END, id ASC`
   ).bind(memberLevelId, productId, skuId, skuId).all<MemberLevelPriceRow>();
-  for (const row of rows.results || []) {
+  return resolveMemberUnitPriceFromRows(level, rows.results || [], skuId, baseUnitPrice);
+}
+
+function resolveMemberUnitPriceFromRows(
+  level: MemberLevelRow | null,
+  rows: MemberLevelPriceRow[],
+  skuId: number,
+  baseUnitPrice: number
+): { unitPrice: number; discountAmount: number } {
+  const baseCents = moneyToCents(baseUnitPrice);
+  if (!level || baseCents <= 0) return { unitPrice: centsToMoney(baseCents), discountAmount: 0 };
+  const orderedRows = [...rows].sort((left, right) => {
+    const leftPriority = Number(left.sku_id) === skuId ? 0 : 1;
+    const rightPriority = Number(right.sku_id) === skuId ? 0 : 1;
+    return leftPriority - rightPriority || Number(left.id) - Number(right.id);
+  });
+  for (const row of orderedRows) {
+    if (Number(row.sku_id) !== skuId && Number(row.sku_id) !== 0) continue;
     const priceCents = moneyToCents(Number(row.price_amount || 0));
     if (priceCents > 0 && priceCents < baseCents) {
       return { unitPrice: centsToMoney(priceCents), discountAmount: centsToMoney(baseCents - priceCents) };
@@ -17862,18 +18132,108 @@ async function syncSkus(env: Env, productId: number, skus: AnyRecord[], productP
   }
 }
 
-async function hydrateProduct(env: Env, product: ProductRow, options: { publicOnly: boolean; resellerContext?: ResellerContext | null }): Promise<AnyRecord> {
-  const [category, skus] = await Promise.all([
-    product.category_id ? env.DB.prepare("SELECT * FROM categories WHERE id=?").bind(product.category_id).first<CategoryRow>() : null,
-    env.DB.prepare("SELECT * FROM product_skus WHERE product_id=? ORDER BY sort_order ASC, id ASC").bind(product.id).all<SkuRow>()
+type ProductHydrationPreload = {
+  categories: Map<number, CategoryRow>;
+  skus: Map<number, SkuRow[]>;
+  upstreamProductIds: Set<number>;
+  autoStock: Map<number, Map<number, CardSecretStockCounts>>;
+};
+
+async function preloadProductHydration(env: Env, products: ProductRow[]): Promise<ProductHydrationPreload> {
+  const productIds = Array.from(new Set(products.map((product) => Number(product.id || 0)).filter((id) => id > 0)));
+  if (!productIds.length) {
+    return {
+      categories: new Map(),
+      skus: new Map(),
+      upstreamProductIds: new Set(),
+      autoStock: new Map()
+    };
+  }
+  const categoryIds = Array.from(new Set(products.map((product) => Number(product.category_id || 0)).filter((id) => id > 0)));
+  const autoProductIds = products
+    .filter((product) => (clean(product.fulfillment_type, 40) || "manual") === "auto")
+    .map((product) => Number(product.id || 0));
+  const productPlaceholders = productIds.map(() => "?").join(",");
+  const categoryPlaceholders = categoryIds.map(() => "?").join(",");
+  const autoPlaceholders = autoProductIds.map(() => "?").join(",");
+  const [categoryResult, skuResult, mappingResult, stockResult] = await env.DB.batch([
+    categoryIds.length
+      ? env.DB.prepare(`SELECT * FROM categories WHERE id IN (${categoryPlaceholders})`).bind(...categoryIds)
+      : env.DB.prepare("SELECT * FROM categories WHERE 1=0"),
+    env.DB.prepare(
+      `SELECT * FROM product_skus WHERE product_id IN (${productPlaceholders}) ORDER BY product_id ASC, sort_order ASC, id ASC`
+    ).bind(...productIds),
+    env.DB.prepare(
+      `SELECT DISTINCT local_product_id AS product_id FROM product_mappings
+       WHERE local_product_id IN (${productPlaceholders}) AND is_active=1`
+    ).bind(...productIds),
+    autoProductIds.length
+      ? env.DB.prepare(
+        `SELECT product_id, sku_id, COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN status='available' THEN 1 ELSE 0 END), 0) AS available,
+                COALESCE(SUM(CASE WHEN status='reserved' THEN 1 ELSE 0 END), 0) AS reserved,
+                COALESCE(SUM(CASE WHEN status='used' THEN 1 ELSE 0 END), 0) AS used
+         FROM card_secrets WHERE product_id IN (${autoPlaceholders}) GROUP BY product_id, sku_id`
+      ).bind(...autoProductIds)
+      : env.DB.prepare("SELECT product_id, sku_id, 0 AS total, 0 AS available, 0 AS reserved, 0 AS used FROM card_secrets WHERE 1=0")
   ]);
+
+  const categories = new Map<number, CategoryRow>();
+  for (const row of (categoryResult.results || []) as CategoryRow[]) categories.set(Number(row.id), row);
+
+  const skus = new Map<number, SkuRow[]>();
+  for (const row of (skuResult.results || []) as SkuRow[]) {
+    const productRows = skus.get(Number(row.product_id)) || [];
+    productRows.push(row);
+    skus.set(Number(row.product_id), productRows);
+  }
+
+  const upstreamProductIds = new Set<number>(
+    ((mappingResult.results || []) as Array<{ product_id: number }>).map((row) => Number(row.product_id || 0))
+  );
+  const autoStock = new Map<number, Map<number, CardSecretStockCounts>>();
+  for (const productId of autoProductIds) autoStock.set(productId, new Map());
+  for (const row of (stockResult.results || []) as Array<CardSecretStockCounts & { product_id: number; sku_id: number }>) {
+    const productStock = autoStock.get(Number(row.product_id)) || new Map<number, CardSecretStockCounts>();
+    productStock.set(Number(row.sku_id), {
+      total: Number(row.total || 0),
+      available: Number(row.available || 0),
+      reserved: Number(row.reserved || 0),
+      used: Number(row.used || 0)
+    });
+    autoStock.set(Number(row.product_id), productStock);
+  }
+  return { categories, skus, upstreamProductIds, autoStock };
+}
+
+async function hydrateProduct(
+  env: Env,
+  product: ProductRow,
+  options: {
+    publicOnly: boolean;
+    resellerContext?: ResellerContext | null;
+    includeRelatedPosts?: boolean;
+    preload?: ProductHydrationPreload;
+  }
+): Promise<AnyRecord> {
+  const [category, loadedSkus] = options.preload
+    ? [options.preload.categories.get(Number(product.category_id || 0)) || null, options.preload.skus.get(product.id) || []]
+    : await Promise.all([
+      product.category_id ? env.DB.prepare("SELECT * FROM categories WHERE id=?").bind(product.category_id).first<CategoryRow>() : null,
+      env.DB.prepare("SELECT * FROM product_skus WHERE product_id=? ORDER BY sort_order ASC, id ASC").bind(product.id).all<SkuRow>()
+        .then((result) => result.results || [])
+    ]);
   const fulfillmentType = clean(product.fulfillment_type, 40) || "manual";
   const isAutoFulfillment = fulfillmentType === "auto";
   const isUpstreamFulfillment = fulfillmentType === "upstream";
-  const skuSource = skus.results || [];
-  const usesUpstreamStock = isUpstreamFulfillment && await productHasActiveUpstreamMapping(env, product.id);
+  const skuSource = loadedSkus;
+  const usesUpstreamStock = isUpstreamFulfillment && (options.preload
+    ? options.preload.upstreamProductIds.has(product.id)
+    : await productHasActiveUpstreamMapping(env, product.id));
   const usesCardSecretStock = isAutoFulfillment;
-  const autoStockMap = usesCardSecretStock ? await loadCardSecretStockMap(env, product.id) : new Map<number, CardSecretStockCounts>();
+  const autoStockMap = usesCardSecretStock
+    ? (options.preload?.autoStock.get(product.id) || await loadCardSecretStockMap(env, product.id))
+    : new Map<number, CardSecretStockCounts>();
   let skuRows = skuSource.map((row) => formatSku(row, autoStockMap.get(row.id), usesUpstreamStock));
   let resellerBasePriceAmount = Number(product.price_amount || 0);
   if (options.publicOnly && options.resellerContext) {
@@ -17932,7 +18292,9 @@ async function hydrateProduct(env: Env, product: ProductRow, options: { publicOn
       ? stockSummary.sold
       : 0;
   const stockStatus = stockStatusFor(available);
-  const relatedPosts = options.publicOnly ? await relatedPostsForProduct(env, product.id) : [];
+  const relatedPosts = options.publicOnly && options.includeRelatedPosts !== false
+    ? await relatedPostsForProduct(env, product.id)
+    : [];
   const activeSkuRows = skuRows.filter((sku) => sku.is_active);
   const displayPriceAmount = activeSkuRows.length
     ? Math.min(...activeSkuRows.map((sku) => Number(sku.price_amount || 0)))
@@ -18052,6 +18414,10 @@ async function hydrateOrder(
 ): Promise<AnyRecord> {
   const includeChildren = options.includeChildren !== false;
   const includeCost = options.includeCost === true;
+  if (includeChildren && order.parent_id == null) {
+    const results = await env.DB.batch(rootOrderHydrationStatements(env, order.id));
+    return formatRootOrderHydration(order, results, includeCost);
+  }
   const itemsQuery = order.parent_id == null
     ? env.DB.prepare(
       `SELECT oi.* FROM order_items oi
@@ -18075,14 +18441,248 @@ async function hydrateOrder(
   const storedItems = itemsResult.results || [];
   const items = storedItems.map((item) => formatOrderItem(item, includeCost));
   const payments = (paymentsResult.results || []).map(formatPayment);
-  const formattedFulfillment = fulfillment ? formatFulfillment(fulfillment) : null;
   const [products, children] = await Promise.all([
     productRowsByIds(env, storedItems.map((item) => Number(item.product_id || 0))),
-    includeChildren && order.parent_id == null
-      ? hydrateOrderChildren(env, order, items, formattedFulfillment, payments, includeCost)
-      : Promise.resolve([])
+    Promise.resolve([])
   ]);
   const allowedPaymentChannelIds = productPaymentChannelIntersection(products);
+  return formatHydratedOrderRecord(
+    order,
+    items,
+    payments,
+    fulfillment || undefined,
+    allowedPaymentChannelIds,
+    children
+  );
+}
+
+async function hydrateRootOrders(
+  env: Env,
+  orders: OrderRow[],
+  options: { includeCost?: boolean } = {}
+): Promise<AnyRecord[]> {
+  if (!orders.length) return [];
+  const rootOrders = orders.filter((order) => order.parent_id == null);
+  if (!rootOrders.length) {
+    return Promise.all(orders.map((order) => hydrateOrder(env, order, { includeChildren: false, ...options })));
+  }
+
+  const rootIds = rootOrders.map((order) => Number(order.id));
+  const placeholders = rootIds.map(() => "?").join(",");
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `SELECT oi.*, COALESCE(item_order.parent_id, item_order.id) AS root_order_id
+       FROM order_items oi
+       JOIN orders item_order ON item_order.id=oi.order_id
+       WHERE item_order.id IN (${placeholders}) OR item_order.parent_id IN (${placeholders})
+       ORDER BY root_order_id ASC, item_order.id ASC, oi.id ASC`
+    ).bind(...rootIds, ...rootIds),
+    env.DB.prepare(
+      `SELECT f.*, COALESCE(fulfillment_order.parent_id, fulfillment_order.id) AS root_order_id
+       FROM fulfillments f
+       JOIN orders fulfillment_order ON fulfillment_order.id=f.order_id
+       WHERE fulfillment_order.id IN (${placeholders}) OR fulfillment_order.parent_id IN (${placeholders})
+       ORDER BY root_order_id ASC, f.order_id ASC, f.id ASC`
+    ).bind(...rootIds, ...rootIds),
+    env.DB.prepare(
+      `SELECT p.*, pc.name AS channel_name,
+              COALESCE(payment_order.parent_id, payment_order.id) AS root_order_id
+       FROM payments p
+       LEFT JOIN payment_channels pc ON pc.id=p.channel_id
+       JOIN orders payment_order ON payment_order.id=p.order_id
+       WHERE payment_order.id IN (${placeholders}) OR payment_order.parent_id IN (${placeholders})
+       ORDER BY root_order_id ASC, p.order_id ASC, p.id DESC`
+    ).bind(...rootIds, ...rootIds),
+    env.DB.prepare(
+      `SELECT child.*, child.parent_id AS root_order_id
+       FROM orders child
+       WHERE child.parent_id IN (${placeholders})
+       ORDER BY child.parent_id ASC, child.id ASC`
+    ).bind(...rootIds),
+    env.DB.prepare(
+      `SELECT DISTINCT COALESCE(item_order.parent_id, item_order.id) AS root_order_id, product.*
+       FROM products product
+       JOIN order_items oi ON oi.product_id=product.id
+       JOIN orders item_order ON item_order.id=oi.order_id
+       WHERE item_order.id IN (${placeholders}) OR item_order.parent_id IN (${placeholders})`
+    ).bind(...rootIds, ...rootIds)
+  ]);
+
+  type RootScoped<T> = T & { root_order_id: number };
+  const itemsByRoot = groupRowsByNumber(
+    (results[0]?.results || []) as RootScoped<OrderItemRow>[],
+    (row) => row.root_order_id
+  );
+  const fulfillmentsByRoot = groupRowsByNumber(
+    (results[1]?.results || []) as RootScoped<FulfillmentRow>[],
+    (row) => row.root_order_id
+  );
+  const paymentsByRoot = groupRowsByNumber(
+    (results[2]?.results || []) as RootScoped<PaymentRow>[],
+    (row) => row.root_order_id
+  );
+  const childrenByRoot = groupRowsByNumber(
+    (results[3]?.results || []) as RootScoped<OrderRow>[],
+    (row) => row.root_order_id
+  );
+  const productsByRoot = groupRowsByNumber(
+    (results[4]?.results || []) as RootScoped<ProductRow>[],
+    (row) => row.root_order_id
+  );
+  const includeCost = options.includeCost === true;
+  const hydratedRoots = new Map<number, AnyRecord>();
+  for (const order of rootOrders) {
+    hydratedRoots.set(order.id, formatRootOrderHydrationRows(
+      order,
+      itemsByRoot.get(order.id) || [],
+      fulfillmentsByRoot.get(order.id) || [],
+      paymentsByRoot.get(order.id) || [],
+      childrenByRoot.get(order.id) || [],
+      productsByRoot.get(order.id) || [],
+      includeCost
+    ));
+  }
+
+  return Promise.all(orders.map((order) => {
+    const hydrated = hydratedRoots.get(order.id);
+    return hydrated
+      ? Promise.resolve(hydrated)
+      : hydrateOrder(env, order, { includeChildren: false, ...options });
+  }));
+}
+
+function rootOrderHydrationStatements(env: Env, orderId: number): Array<ReturnType<D1Database["prepare"]>> {
+  return [
+    env.DB.prepare(
+      `SELECT oi.* FROM order_items oi
+       JOIN orders item_order ON item_order.id=oi.order_id
+       WHERE item_order.id=? OR item_order.parent_id=?
+       ORDER BY item_order.id ASC, oi.id ASC`
+    ).bind(orderId, orderId),
+    env.DB.prepare(
+      `SELECT f.* FROM fulfillments f
+       JOIN orders fulfillment_order ON fulfillment_order.id=f.order_id
+       WHERE fulfillment_order.id=? OR fulfillment_order.parent_id=?`
+    ).bind(orderId, orderId),
+    env.DB.prepare(
+      `SELECT p.*, pc.name AS channel_name
+       FROM payments p
+       LEFT JOIN payment_channels pc ON pc.id=p.channel_id
+       JOIN orders payment_order ON payment_order.id=p.order_id
+       WHERE payment_order.id=? OR payment_order.parent_id=?
+       ORDER BY p.order_id ASC, p.id DESC`
+    ).bind(orderId, orderId),
+    env.DB.prepare("SELECT * FROM orders WHERE parent_id=? ORDER BY id ASC").bind(orderId),
+    env.DB.prepare(
+      `SELECT DISTINCT p.* FROM products p
+       JOIN order_items oi ON oi.product_id=p.id
+       JOIN orders item_order ON item_order.id=oi.order_id
+       WHERE item_order.id=? OR item_order.parent_id=?`
+    ).bind(orderId, orderId)
+  ];
+}
+
+async function hydrateRootOrderById(env: Env, orderId: number, includeCost = false): Promise<AnyRecord | null> {
+  const [orderResult, ...hydrationResults] = await env.DB.batch([
+    env.DB.prepare("SELECT * FROM orders WHERE id=? AND parent_id IS NULL").bind(orderId),
+    ...rootOrderHydrationStatements(env, orderId)
+  ]);
+  const order = orderResult.results?.[0] as OrderRow | undefined;
+  return order ? formatRootOrderHydration(order, hydrationResults, includeCost) : null;
+}
+
+function formatRootOrderHydration(
+  order: OrderRow,
+  results: D1Result<unknown>[],
+  includeCost: boolean
+): AnyRecord {
+  const [itemsResult, fulfillmentsResult, paymentsResult, childrenResult, productsResult] = results;
+  return formatRootOrderHydrationRows(
+    order,
+    (itemsResult?.results || []) as OrderItemRow[],
+    (fulfillmentsResult?.results || []) as FulfillmentRow[],
+    (paymentsResult?.results || []) as PaymentRow[],
+    (childrenResult?.results || []) as OrderRow[],
+    (productsResult?.results || []) as ProductRow[],
+    includeCost
+  );
+}
+
+function formatRootOrderHydrationRows(
+  order: OrderRow,
+  storedItems: OrderItemRow[],
+  fulfillmentRows: FulfillmentRow[],
+  paymentRows: PaymentRow[],
+  childRows: OrderRow[],
+  products: ProductRow[],
+  includeCost: boolean
+): AnyRecord {
+  const itemsByOrder = groupRowsByNumber(storedItems, (item) => item.order_id);
+  const fulfillmentsByOrder = new Map(fulfillmentRows.map((row) => [Number(row.order_id), row]));
+  const paymentsByOrder = groupRowsByNumber(paymentRows, (payment) => payment.order_id);
+  const productsById = new Map(products.map((product) => [Number(product.id), product]));
+  const allItems = storedItems.map((item) => formatOrderItem(item, includeCost));
+  const parentFulfillment = fulfillmentsByOrder.get(order.id);
+  const parentPayments = (paymentsByOrder.get(order.id) || []).map(formatPayment);
+  const children = childRows.length
+    ? childRows.map((child) => {
+        const childStoredItems = itemsByOrder.get(child.id) || [];
+        const childProducts = childStoredItems
+          .map((item) => productsById.get(Number(item.product_id)))
+          .filter((product): product is ProductRow => Boolean(product));
+        return formatHydratedOrderRecord(
+          child,
+          childStoredItems.map((item) => formatOrderItem(item, includeCost)),
+          (paymentsByOrder.get(child.id) || []).map(formatPayment),
+          fulfillmentsByOrder.get(child.id),
+          productPaymentChannelIntersection(childProducts),
+          []
+        );
+      })
+    : allItems.length
+      ? [{
+          ...formatHydratedOrderRecord(
+            order,
+            allItems,
+            parentPayments,
+            parentFulfillment,
+            productPaymentChannelIntersection(products),
+            []
+          ),
+          id: order.id,
+          order_no: `${order.order_no}-01`,
+          parent_id: order.id
+        }]
+      : [];
+  return formatHydratedOrderRecord(
+    order,
+    allItems,
+    parentPayments,
+    childRows.length ? undefined : parentFulfillment,
+    productPaymentChannelIntersection(products),
+    children
+  );
+}
+
+function groupRowsByNumber<T>(rows: T[], key: (row: T) => number): Map<number, T[]> {
+  const grouped = new Map<number, T[]>();
+  for (const row of rows) {
+    const id = Number(key(row) || 0);
+    const values = grouped.get(id);
+    if (values) values.push(row);
+    else grouped.set(id, [row]);
+  }
+  return grouped;
+}
+
+function formatHydratedOrderRecord(
+  order: OrderRow,
+  items: AnyRecord[],
+  payments: AnyRecord[],
+  fulfillment: FulfillmentRow | undefined,
+  allowedPaymentChannelIds: number[] | null,
+  children: AnyRecord[]
+): AnyRecord {
   return {
     ...order,
     original_amount: Number(order.original_amount || 0),
@@ -18098,43 +18698,8 @@ async function hydrateOrder(
     payments,
     children,
     ...(allowedPaymentChannelIds === null ? {} : { allowed_payment_channel_ids: allowedPaymentChannelIds }),
-    fulfillment: children.length ? null : formattedFulfillment
+    fulfillment: children.length ? null : (fulfillment ? formatFulfillment(fulfillment) : null)
   };
-}
-
-async function hydrateOrderChildren(
-  env: Env,
-  order: OrderRow,
-  parentItems: AnyRecord[],
-  parentFulfillment: AnyRecord | null,
-  parentPayments: AnyRecord[],
-  includeCost: boolean
-): Promise<AnyRecord[]> {
-  const childRows = await env.DB.prepare("SELECT * FROM orders WHERE parent_id=? ORDER BY id ASC").bind(order.id).all<OrderRow>();
-  if (childRows.results?.length) {
-    return Promise.all(childRows.results.map((child) => hydrateOrder(env, child, { includeChildren: false, includeCost })));
-  }
-
-  if (!parentItems.length) return [];
-  return [{
-    ...order,
-    id: order.id,
-    order_no: `${order.order_no}-01`,
-    parent_id: order.id,
-    original_amount: Number(order.original_amount || 0),
-    discount_amount: Number(order.discount_amount || 0),
-    promotion_discount_amount: Number(order.promotion_discount_amount || 0),
-    wholesale_discount_amount: Number(order.wholesale_discount_amount || 0),
-    member_discount_amount: Number(order.member_discount_amount || 0),
-    total_amount: Number(order.total_amount || 0),
-    wallet_paid_amount: Number(order.wallet_paid_amount || 0),
-    online_paid_amount: Number(order.online_paid_amount || 0),
-    refunded_amount: Number(order.refunded_amount || 0),
-    items: parentItems,
-    payments: parentPayments,
-    children: [],
-    fulfillment: parentFulfillment
-  }];
 }
 
 function formatOrderItem(item: OrderItemRow, includeCost = false): AnyRecord {
@@ -18623,6 +19188,34 @@ async function reserveManualStockForOrder(env: Env, orderId: number): Promise<bo
   }
 }
 
+async function reserveFreshCardSecretsForOrder(
+  env: Env,
+  orderId: number,
+  product: ProductRow,
+  sku: SkuRow,
+  quantity: number
+): Promise<CardSecretRow[]> {
+  const updated = await env.DB.prepare(
+    `UPDATE card_secrets
+     SET status='reserved', order_id=?, reserved_at=CURRENT_TIMESTAMP, used_at=NULL, updated_at=CURRENT_TIMESTAMP
+     WHERE status='available' AND id IN (
+       SELECT id FROM card_secrets
+       WHERE product_id=? AND sku_id=? AND status='available'
+       ORDER BY id ASC LIMIT ?
+     )
+     RETURNING *`
+  ).bind(orderId, product.id, sku.id, quantity).all<CardSecretRow>();
+  const rows = (updated.results || []).sort((left, right) => left.id - right.id);
+  if (rows.length !== quantity) {
+    await env.DB.prepare(
+      `UPDATE card_secrets SET status='available', order_id=NULL, reserved_at=NULL, updated_at=CURRENT_TIMESTAMP
+       WHERE order_id=? AND status='reserved'`
+    ).bind(orderId).run();
+    return [];
+  }
+  return rows;
+}
+
 type OrderProcessingStep = "manual_stock_consumed_at" | "business_effects_completed_at" | "notifications_sent_at";
 
 async function ensureOrderProcessingState(env: Env, orderId: number): Promise<AnyRecord> {
@@ -18842,37 +19435,38 @@ async function exceedsPendingOrderLimit(
   input: OrderRiskCheckInput,
   config: OrderRiskControlConfig
 ): Promise<boolean> {
-  const checks: Array<{ enabled: boolean; sql: string; value: unknown }> = [
+  const checks: Array<{ enabled: boolean; sql: string; value: unknown; limit: number }> = [
     {
       enabled: input.userId > 0 && config.max_pending_orders_per_user > 0,
       sql: "SELECT COUNT(*) AS count FROM orders WHERE user_id=? AND parent_id IS NULL AND status='pending_payment'",
-      value: input.userId
+      value: input.userId,
+      limit: config.max_pending_orders_per_user
     },
     {
       enabled: !input.skipIpCheck && !!input.clientIp && config.max_pending_orders_per_ip > 0,
       sql: "SELECT COUNT(*) AS count FROM orders WHERE client_ip=? AND parent_id IS NULL AND status='pending_payment'",
-      value: input.clientIp
+      value: input.clientIp,
+      limit: config.max_pending_orders_per_ip
     },
     {
       enabled: input.isGuest && !!input.guestEmail && config.max_pending_orders_per_guest_email > 0,
       sql: "SELECT COUNT(*) AS count FROM orders WHERE lower(guest_email)=? AND parent_id IS NULL AND status='pending_payment'",
-      value: input.guestEmail.toLowerCase()
+      value: input.guestEmail.toLowerCase(),
+      limit: config.max_pending_orders_per_guest_email
     }
   ];
-  const limits = [
-    config.max_pending_orders_per_user,
-    config.max_pending_orders_per_ip,
-    config.max_pending_orders_per_guest_email
-  ];
-  for (let index = 0; index < checks.length; index += 1) {
-    const check = checks[index];
-    if (!check.enabled) continue;
-    try {
-      const row = await env.DB.prepare(check.sql).bind(check.value).first<{ count: number }>();
-      if (Number(row?.count || 0) >= limits[index]) return true;
-    } catch (error) {
-      console.warn("pending order risk check unavailable", error);
-    }
+  const enabledChecks = checks.filter((check) => check.enabled);
+  if (!enabledChecks.length) return false;
+  try {
+    const results = await env.DB.batch(
+      enabledChecks.map((check) => env.DB.prepare(check.sql).bind(check.value))
+    );
+    return results.some((result, index) => {
+      const row = result.results?.[0] as { count?: number } | undefined;
+      return Number(row?.count || 0) >= enabledChecks[index].limit;
+    });
+  } catch (error) {
+    console.warn("pending order risk check unavailable", error);
   }
   return false;
 }
@@ -19044,41 +19638,44 @@ async function cancelExpiredPendingOrders(env: Env): Promise<number> {
   let canceled = 0;
   for (const orderId of orderIds) {
     try {
-      const result = await env.DB.prepare(
-        `UPDATE orders
-         SET status='canceled',
-             canceled_at=COALESCE(canceled_at, CURRENT_TIMESTAMP),
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=? AND status='pending_payment'
-           AND expires_at IS NOT NULL
-           AND ${dashboardSqlDate("expires_at")} <= datetime(?)`
-      ).bind(orderId, now).run();
-      const order = await env.DB.prepare("SELECT status FROM orders WHERE id=?")
-        .bind(orderId)
-        .first<{ status: string }>();
-      if (order?.status !== "canceled") continue;
-      if (Number(result.meta.changes || 0) === 1) canceled += 1;
-
-      await env.DB.prepare(
-        `UPDATE orders SET status='canceled', canceled_at=COALESCE(canceled_at, CURRENT_TIMESTAMP),
-         updated_at=CURRENT_TIMESTAMP WHERE parent_id=? AND status='pending_payment'`
-      ).bind(orderId).run();
-
-      await env.DB.prepare("INSERT OR IGNORE INTO order_maintenance_state (order_id) VALUES (?)")
-        .bind(orderId)
-        .run();
-      await cancelOrderTreeAndRelease(env, orderId);
-      await env.DB.prepare(
-        `UPDATE order_maintenance_state
-         SET expiry_cleanup_completed_at=COALESCE(expiry_cleanup_completed_at, CURRENT_TIMESTAMP),
-             updated_at=CURRENT_TIMESTAMP
-         WHERE order_id=?`
-      ).bind(orderId).run();
+      if (await cancelExpiredPendingOrder(env, orderId, now)) canceled += 1;
     } catch (error) {
       console.warn(`expired order cleanup failed for order ${orderId}`, error);
     }
   }
   return canceled;
+}
+
+async function cancelExpiredPendingOrder(env: Env, orderId: number, now = dashboardDbDate(new Date())): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `UPDATE orders
+     SET status='canceled',
+         canceled_at=COALESCE(canceled_at, CURRENT_TIMESTAMP),
+         updated_at=CURRENT_TIMESTAMP
+     WHERE id=? AND status='pending_payment'
+       AND expires_at IS NOT NULL
+       AND ${dashboardSqlDate("expires_at")} <= datetime(?)`
+  ).bind(orderId, now).run();
+  const order = await env.DB.prepare("SELECT status FROM orders WHERE id=?")
+    .bind(orderId)
+    .first<{ status: string }>();
+  if (order?.status !== "canceled") return false;
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE orders SET status='canceled', canceled_at=COALESCE(canceled_at, CURRENT_TIMESTAMP),
+       updated_at=CURRENT_TIMESTAMP WHERE parent_id=? AND status='pending_payment'`
+    ).bind(orderId),
+    env.DB.prepare("INSERT OR IGNORE INTO order_maintenance_state (order_id) VALUES (?)").bind(orderId)
+  ]);
+  await cancelOrderTreeAndRelease(env, orderId);
+  await env.DB.prepare(
+    `UPDATE order_maintenance_state
+     SET expiry_cleanup_completed_at=COALESCE(expiry_cleanup_completed_at, CURRENT_TIMESTAMP),
+         updated_at=CURRENT_TIMESTAMP
+     WHERE order_id=?`
+  ).bind(orderId).run();
+  return Number(result.meta.changes || 0) === 1;
 }
 
 async function consumeCardSecretsForOrder(
@@ -19222,30 +19819,46 @@ async function rebuildOrderFulfillment(env: Env, orderId: number): Promise<void>
 }
 
 async function refreshOrderFulfillmentStatus(env: Env, orderId: number): Promise<string> {
-  const order = await env.DB.prepare("SELECT status, parent_id FROM orders WHERE id=?")
-    .bind(orderId)
-    .first<{ status: string; parent_id: number | null }>();
+  const results = await env.DB.batch([
+    env.DB.prepare("SELECT status, parent_id FROM orders WHERE id=?").bind(orderId),
+    env.DB.prepare(
+      `SELECT
+         COUNT(*) AS total_count,
+         SUM(CASE WHEN COALESCE(NULLIF(fulfillment_type, ''), 'manual')='auto' THEN 1 ELSE 0 END) AS auto_count,
+         SUM(CASE WHEN COALESCE(NULLIF(fulfillment_type, ''), 'manual')='manual' THEN 1 ELSE 0 END) AS manual_count,
+         SUM(CASE WHEN COALESCE(NULLIF(fulfillment_type, ''), 'manual')='upstream' THEN 1 ELSE 0 END) AS upstream_count
+       FROM order_items WHERE order_id=?`
+    ).bind(orderId),
+    env.DB.prepare(
+      `SELECT
+         SUM(CASE WHEN source_type='auto' THEN 1 ELSE 0 END) AS auto_count,
+         SUM(CASE WHEN source_type='manual' THEN 1 ELSE 0 END) AS manual_count,
+         COUNT(*) AS total_count
+       FROM fulfillment_components WHERE order_id=? AND payload<>''`
+    ).bind(orderId),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS total_count,
+              SUM(CASE WHEN status='fulfilled' THEN 1 ELSE 0 END) AS fulfilled_count
+       FROM procurement_orders WHERE local_order_id=?`
+    ).bind(orderId)
+  ]);
+  const order = results[0].results?.[0] as { status: string; parent_id: number | null } | undefined;
   if (!order) return "";
-  const itemCounts = await env.DB.prepare(
-    `SELECT
-       COUNT(*) AS total_count,
-       SUM(CASE WHEN COALESCE(NULLIF(fulfillment_type, ''), 'manual')='auto' THEN 1 ELSE 0 END) AS auto_count,
-       SUM(CASE WHEN COALESCE(NULLIF(fulfillment_type, ''), 'manual')='manual' THEN 1 ELSE 0 END) AS manual_count,
-       SUM(CASE WHEN COALESCE(NULLIF(fulfillment_type, ''), 'manual')='upstream' THEN 1 ELSE 0 END) AS upstream_count
-     FROM order_items WHERE order_id=?`
-  ).bind(orderId).first<{ total_count: number; auto_count: number; manual_count: number; upstream_count: number }>();
-  const componentCounts = await env.DB.prepare(
-    `SELECT
-       SUM(CASE WHEN source_type='auto' THEN 1 ELSE 0 END) AS auto_count,
-       SUM(CASE WHEN source_type='manual' THEN 1 ELSE 0 END) AS manual_count,
-       COUNT(*) AS total_count
-     FROM fulfillment_components WHERE order_id=? AND payload<>''`
-  ).bind(orderId).first<{ auto_count: number; manual_count: number; total_count: number }>();
-  const procurementCounts = await env.DB.prepare(
-    `SELECT COUNT(*) AS total_count,
-            SUM(CASE WHEN status='fulfilled' THEN 1 ELSE 0 END) AS fulfilled_count
-     FROM procurement_orders WHERE local_order_id=?`
-  ).bind(orderId).first<{ total_count: number; fulfilled_count: number }>();
+  const itemCounts = results[1].results?.[0] as {
+    total_count?: number;
+    auto_count?: number;
+    manual_count?: number;
+    upstream_count?: number;
+  } | undefined;
+  const componentCounts = results[2].results?.[0] as {
+    auto_count?: number;
+    manual_count?: number;
+    total_count?: number;
+  } | undefined;
+  const procurementCounts = results[3].results?.[0] as {
+    total_count?: number;
+    fulfilled_count?: number;
+  } | undefined;
 
   const totalItems = Number(itemCounts?.total_count || 0);
   if (!totalItems) return order.status;
@@ -19297,7 +19910,14 @@ async function setting(env: Env, key: string, fallback: AnyRecord): Promise<AnyR
 }
 
 async function runtimeFlag(env: Env, key: string): Promise<boolean> {
+  const cached = CACHEABLE_SETTING_KEYS.has(key) ? settingCache.get(key) : undefined;
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.raw === null ? false : jsonParse<boolean>(cached.raw, false) === true;
+  }
   const row = await env.DB.prepare("SELECT value_json FROM settings WHERE key=?").bind(key).first<{ value_json: string }>();
+  if (CACHEABLE_SETTING_KEYS.has(key)) {
+    settingCache.set(key, { raw: row?.value_json ?? null, expiresAt: Date.now() + SETTING_CACHE_TTL_MS });
+  }
   return row ? jsonParse<boolean>(row.value_json, false) === true : false;
 }
 
@@ -19306,6 +19926,7 @@ async function upsertSetting(env: Env, key: string, value: unknown): Promise<voi
     "INSERT INTO settings (key, value_json) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=CURRENT_TIMESTAMP"
   ).bind(key, JSON.stringify(value ?? {})).run();
   settingCache.delete(key);
+  if (PUBLIC_CONFIG_SETTING_KEYS.has(key)) publicConfigCache.clear();
 }
 
 function sanitizeSettingValue(key: string, value: unknown): unknown {
@@ -20835,17 +21456,18 @@ async function adjustWalletBalance(
     remark?: string;
     relatedType?: string;
     relatedId?: number | null;
-  }
+  },
+  options: { walletReady?: boolean } = {}
 ): Promise<WalletTransactionRow | null> {
-  await ensureWallet(env, userId);
+  if (!options.walletReady) await ensureWallet(env, userId);
   const amountCents = moneyToCents(Number(amount || 0));
   if (amountCents <= 0) return null;
   const delta = centsToMoney(amountCents);
-  const existing = await idempotentWalletTransaction(env, userId, meta);
-  if (existing) return existing;
   if (await runtimeFlag(env, "atomic_wallet_adjustments_enabled")) {
     return atomicWalletBalanceAdjustment(env, userId, delta, direction, meta);
   }
+  const existing = await idempotentWalletTransaction(env, userId, meta);
+  if (existing) return existing;
   const balanceUpdate = direction === "out"
     ? await env.DB.prepare(
       "UPDATE user_wallets SET balance=ROUND(balance-?, 2), updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND balance>=?"
@@ -20937,25 +21559,26 @@ async function atomicWalletBalanceAdjustment(
     const raced = await idempotentWalletTransaction(env, userId, meta);
     if (raced) return raced;
     if (/unique constraint failed.*wallet_adjustments\.idempotency_key/i.test(message)) {
-      const adjustment = await env.DB.prepare(
-        "SELECT wallet_txn_id FROM wallet_adjustments WHERE idempotency_key=?"
-      ).bind(idempotencyKey).first<{ wallet_txn_id: number | null }>();
-      if (adjustment?.wallet_txn_id) {
-        return env.DB.prepare("SELECT * FROM wallet_transactions WHERE id=?")
-          .bind(adjustment.wallet_txn_id)
-          .first<WalletTransactionRow>();
-      }
+      const existing = await walletTransactionByAdjustmentKey(env, idempotencyKey);
+      if (existing) return existing;
     }
     throw error;
   }
+  const transaction = await env.DB.prepare(
+    `SELECT wt.* FROM wallet_adjustments wa
+     JOIN wallet_transactions wt ON wt.id=wa.wallet_txn_id
+     WHERE wa.id=? LIMIT 1`
+  ).bind(adjustmentId).first<WalletTransactionRow>();
+  if (!transaction) throw new Error("wallet_adjustment_transaction_missing");
+  return transaction;
+}
 
-  const adjustment = await env.DB.prepare(
-    "SELECT wallet_txn_id FROM wallet_adjustments WHERE id=?"
-  ).bind(adjustmentId).first<{ wallet_txn_id: number | null }>();
-  if (!adjustment?.wallet_txn_id) throw new Error("wallet_adjustment_transaction_missing");
-  return env.DB.prepare("SELECT * FROM wallet_transactions WHERE id=?")
-    .bind(adjustment.wallet_txn_id)
-    .first<WalletTransactionRow>();
+async function walletTransactionByAdjustmentKey(env: Env, idempotencyKey: string): Promise<WalletTransactionRow | null> {
+  return env.DB.prepare(
+    `SELECT wt.* FROM wallet_adjustments wa
+     JOIN wallet_transactions wt ON wt.id=wa.wallet_txn_id
+     WHERE wa.idempotency_key=? LIMIT 1`
+  ).bind(idempotencyKey).first<WalletTransactionRow>();
 }
 
 function walletAdjustmentIdempotencyKey(
@@ -21015,17 +21638,21 @@ async function idempotentWalletTransaction(
 }
 
 async function applyOrderWalletBalance(env: Env, inputOrder: OrderRow): Promise<OrderRow> {
-  let order = await env.DB.prepare("SELECT * FROM orders WHERE id=?").bind(inputOrder.id).first<OrderRow>() || inputOrder;
+  let order = inputOrder;
   if (order.status !== "pending_payment") throw new ApiRequestError(409, "订单当前状态不能支付");
   if (!order.user_id) throw new ApiRequestError(400, "游客订单不支持余额支付");
   if (moneyToCents(Number(order.wallet_paid_amount || 0)) > 0) return order;
 
-  const released = await env.DB.prepare(
-    "SELECT id FROM wallet_transactions WHERE user_id=? AND order_id=? AND type='order_refund' LIMIT 1"
-  ).bind(order.user_id, order.id).first<{ id: number }>();
+  const [releasedResult, walletResult] = await env.DB.batch([
+    env.DB.prepare(
+      "SELECT id FROM wallet_transactions WHERE user_id=? AND order_id=? AND type='order_refund' LIMIT 1"
+    ).bind(order.user_id, order.id),
+    env.DB.prepare("SELECT * FROM user_wallets WHERE user_id=? LIMIT 1").bind(order.user_id)
+  ]);
+  const released = releasedResult.results?.[0] as { id: number } | undefined;
   if (released) throw new ApiRequestError(409, "该订单的余额已退回，请改用在线支付或重新下单");
 
-  const wallet = await ensureWallet(env, order.user_id);
+  const wallet = (walletResult.results?.[0] as WalletRow | undefined) || await ensureWallet(env, order.user_id);
   const amount = centsToMoney(Math.min(
     moneyToCents(Number(wallet.balance || 0)),
     moneyToCents(Number(order.total_amount || 0))
@@ -21037,19 +21664,27 @@ async function applyOrderWalletBalance(env: Env, inputOrder: OrderRow): Promise<
     orderId: order.id,
     reference: order.order_no,
     remark: `订单余额支付 ${order.order_no}`
-  });
+  }, { walletReady: true });
   if (!transaction) throw new ApiRequestError(409, "钱包余额不足，请刷新后重试");
 
   const effectiveAmount = centsToMoney(Math.min(
     moneyToCents(Number(transaction.amount || amount)),
     moneyToCents(Number(order.total_amount || 0))
   ));
-  await env.DB.prepare(
-    `UPDATE orders
-     SET wallet_paid_amount=?, online_paid_amount=ROUND(total_amount-?, 2), updated_at=CURRENT_TIMESTAMP
-     WHERE id=? AND status='pending_payment' AND wallet_paid_amount=0`
-  ).bind(money(effectiveAmount), money(effectiveAmount), order.id).run();
-  order = await env.DB.prepare("SELECT * FROM orders WHERE id=?").bind(order.id).first<OrderRow>() || order;
+  const [orderUpdate] = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE orders
+       SET wallet_paid_amount=?, online_paid_amount=ROUND(total_amount-?, 2), updated_at=CURRENT_TIMESTAMP
+       WHERE id=? AND status='pending_payment' AND wallet_paid_amount=0
+       RETURNING *`
+    ).bind(money(effectiveAmount), money(effectiveAmount), order.id),
+    env.DB.prepare(
+      `UPDATE payments
+       SET status='expired', expired_at=COALESCE(expired_at, CURRENT_TIMESTAMP), updated_at=CURRENT_TIMESTAMP
+       WHERE order_id=? AND status IN ('initiated','pending','created','')`
+    ).bind(order.id)
+  ]);
+  order = (orderUpdate.results?.[0] as OrderRow | undefined) || order;
   if (moneyToCents(Number(order.wallet_paid_amount || 0)) <= 0) {
     const refund = await adjustWalletBalance(env, order.user_id, effectiveAmount, "in", {
       type: "order_refund",
@@ -21060,7 +21695,6 @@ async function applyOrderWalletBalance(env: Env, inputOrder: OrderRow): Promise<
     if (!refund) throw new Error("wallet_release_failed");
     throw new ApiRequestError(409, "余额支付失败，请刷新后重试");
   }
-  await expireActiveOrderPayments(env, order.id);
   return order;
 }
 
@@ -21225,8 +21859,10 @@ function paymentChannelAcceptsAmount(row: PaymentChannelRow, amount: number): bo
 }
 
 async function availableWalletRechargeChannels(env: Env, amount: number, user: UserRow): Promise<PaymentChannelRow[]> {
-  const channels = await activePaymentChannels(env);
-  const wallet = await walletConfig(env);
+  const [channels, wallet] = await Promise.all([
+    activePaymentChannels(env),
+    walletConfig(env)
+  ]);
   return channels
     .filter((row) => isPaymentChannelAllowedForWalletRecharge(row, user, wallet.rechargeChannelIds))
     .filter((row) => !row.hide_amount_out_range || paymentChannelAcceptsAmount(row, amount));
@@ -21492,17 +22128,38 @@ async function expireDueWalletRecharges(env: Env): Promise<number> {
   ).bind(cutoff).all<{ id: number; payment_id: number }>();
   const items = rows.results || [];
   if (!items.length) return 0;
-  for (const item of items) {
-    await env.DB.prepare("UPDATE wallet_recharges SET status='expired', updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'")
-      .bind(item.id)
-      .run();
+  await env.DB.batch(items.flatMap((item) => {
+    const statements = [
+      env.DB.prepare("UPDATE wallet_recharges SET status='expired', updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'")
+        .bind(item.id)
+    ];
     if (Number(item.payment_id || 0) > 0) {
-      await env.DB.prepare(
+      statements.push(env.DB.prepare(
         "UPDATE payments SET status='expired', expired_at=COALESCE(expired_at, CURRENT_TIMESTAMP), updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('pending', 'created', 'initiated', '')"
-      ).bind(item.payment_id).run();
+      ).bind(item.payment_id));
     }
-  }
+    return statements;
+  }));
   return items.length;
+}
+
+async function expireWalletRechargeIfDue(env: Env, recharge: WalletRechargeRow): Promise<WalletRechargeRow> {
+  if (recharge.status !== "pending") return recharge;
+  const minutes = await orderPaymentExpireMinutes(env);
+  const cutoff = dashboardDbDate(new Date(Date.now() - minutes * 60 * 1000));
+  const expired = await env.DB.prepare(
+    `UPDATE wallet_recharges
+     SET status='expired', updated_at=CURRENT_TIMESTAMP
+     WHERE id=? AND status='pending' AND ${dashboardSqlDate("created_at")} <= datetime(?)
+     RETURNING *`
+  ).bind(recharge.id, cutoff).first<WalletRechargeRow>();
+  if (!expired) return recharge;
+  if (Number(recharge.payment_id || 0) > 0) {
+    await env.DB.prepare(
+      "UPDATE payments SET status='expired', expired_at=COALESCE(expired_at, CURRENT_TIMESTAMP), updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('pending', 'created', 'initiated', '')"
+    ).bind(recharge.payment_id).run();
+  }
+  return expired;
 }
 
 function makeRechargeNo(): string {
@@ -21512,10 +22169,18 @@ function makeRechargeNo(): string {
 }
 
 async function activePaymentChannels(env: Env): Promise<PaymentChannelRow[]> {
+  if (activePaymentChannelCache && activePaymentChannelCache.expiresAt > Date.now()) {
+    return activePaymentChannelCache.rows;
+  }
   const rows = await env.DB.prepare(
     "SELECT * FROM payment_channels WHERE is_active=1 ORDER BY sort_order ASC, id ASC"
   ).all<PaymentChannelRow>();
-  return rows.results || [];
+  const activeRows = rows.results || [];
+  activePaymentChannelCache = {
+    rows: activeRows,
+    expiresAt: Date.now() + PAYMENT_CHANNEL_CACHE_TTL_MS
+  };
+  return activeRows;
 }
 
 async function paymentChannelById(env: Env, id: number): Promise<PaymentChannelRow | null> {
@@ -21582,9 +22247,12 @@ async function availableOrderPaymentChannels(
   amount: number,
   user: UserRow | null
 ): Promise<PaymentChannelRow[]> {
-  if ((await walletConfig(env)).walletOnlyPayment) return [];
+  const [wallet, channels] = await Promise.all([
+    walletConfig(env),
+    activePaymentChannels(env)
+  ]);
+  if (wallet.walletOnlyPayment) return [];
   const allowedIds = productPaymentChannelIntersection(products);
-  const channels = await activePaymentChannels(env);
   return channels.filter((channel) => {
     const providerType = clean(channel.provider_type, 40).toLowerCase();
     if (!["manual", "wallet"].includes(providerType) && !isImplementedPaymentProvider(providerType, channel.channel_type)) return false;
@@ -21601,19 +22269,12 @@ async function validatePaymentChannelForOrder(
   env: Env,
   channel: PaymentChannelRow,
   order: OrderRow,
-  amount: number
+  amount: number,
+  authenticatedUser: UserRow | null,
+  productRows: ProductRow[]
 ): Promise<string> {
-  const [wallet, user, productRows] = await Promise.all([
-    walletConfig(env),
-    order.user_id ? getUserById(env, order.user_id) : Promise.resolve(null),
-    env.DB.prepare(
-      `SELECT DISTINCT p.*
-       FROM order_items oi
-       JOIN orders item_order ON item_order.id=oi.order_id
-       JOIN products p ON p.id=oi.product_id
-       WHERE item_order.id=? OR item_order.parent_id=?`
-    ).bind(order.id, order.id).all<ProductRow>()
-  ]);
+  const wallet = await walletConfig(env);
+  const user = order.user_id ? authenticatedUser : null;
   if (wallet.walletOnlyPayment) return "站点当前仅支持钱包余额支付";
   if (!channel.is_active) return "支付渠道已停用";
   const providerType = clean(channel.provider_type, 40).toLowerCase();
@@ -21624,7 +22285,7 @@ async function validatePaymentChannelForOrder(
   if (!paymentChannelAllowsRole(channel, user)) return "当前账号类型不能使用该支付渠道";
   if (!paymentChannelAllowsMemberLevel(channel, user)) return "当前会员等级不能使用该支付渠道";
   if (!paymentChannelAllowsType(channel, "order")) return "该支付渠道不支持订单支付";
-  const allowedIds = productPaymentChannelIntersection(productRows.results || []);
+  const allowedIds = productPaymentChannelIntersection(productRows);
   if (allowedIds !== null && !allowedIds.includes(channel.id)) return "订单商品不支持该支付渠道";
   return "";
 }
@@ -21635,10 +22296,10 @@ async function createManualPaymentForOrder(
     orderId: number;
     orderNo: string;
     userId: number;
-    guestEmail: string;
-    channelId: number;
-    channel?: PaymentChannelRow;
-    amount: number;
+      guestEmail: string;
+      channelId: number;
+      channel?: PaymentChannelRow;
+      amount: number;
     paidAt?: string | null;
     status?: string;
     providerPayload?: AnyRecord;
@@ -21657,7 +22318,18 @@ async function createManualPaymentForOrder(
       payment_no, order_id, user_id, guest_email, channel_id, provider_type, channel_type,
       interaction_mode, amount, payable_amount, fee_rate, fixed_fee, fee_amount, currency,
       status, provider_payload_json, paid_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CNY', ?, ?, ?)
+    )
+    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CNY', ?, ?, ?
+    WHERE EXISTS (
+      SELECT 1 FROM orders
+      WHERE id=? AND parent_id IS NULL AND status='pending_payment'
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM payments
+        WHERE order_id=? AND channel_id=?
+          AND status IN ('initiated','pending','created')
+          AND (expired_at IS NULL OR expired_at > CURRENT_TIMESTAMP)
+      )
     RETURNING *`
   ).bind(
     paymentNo,
@@ -21675,7 +22347,10 @@ async function createManualPaymentForOrder(
     money(feeAmount),
     status,
     stringify(input.providerPayload || { order_no: input.orderNo, mode: channel?.provider_type || "manual" }),
-    input.paidAt || null
+    input.paidAt || null,
+    input.orderId,
+    input.orderId,
+    channel?.id || input.channelId
   ).first<PaymentRow>();
 }
 
@@ -22614,7 +23289,7 @@ function normalizePublicSiteName(config: AnyRecord): void {
   const brand = config.brand as AnyRecord;
   const current = clean(brand.site_name, 120);
   const seoTitle = localizedConfigText(config.seo?.title);
-  const legacyDefaults = new Set(["Dujiao Store", "Dujiao-Next"]);
+  const legacyDefaults = new Set(["蜂蜜发卡商城", "蜂蜜發卡商城", "Faka Store", "Dujiao-Next"]);
   if ((!current || legacyDefaults.has(current)) && seoTitle && !legacyDefaults.has(seoTitle)) {
     brand.site_name = seoTitle;
   }

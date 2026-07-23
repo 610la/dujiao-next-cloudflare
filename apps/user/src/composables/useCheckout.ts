@@ -944,7 +944,11 @@ export function useCheckout() {
       clearSourceStore()
 
       if (responseData.order) {
-        saveCheckoutOrderSnapshot(String(responseData.order_no), responseData.order)
+        saveCheckoutOrderSnapshot(String(responseData.order_no), {
+          ...responseData.order,
+          __checkout_payment_channels: paymentChannels.value,
+          __checkout_wallet_balance: walletBalance.value,
+        })
       }
 
       // Redirect to the existing Payment page which handles all payment display
@@ -1031,9 +1035,12 @@ export function useCheckout() {
     if (!appStore.config) {
       await appStore.loadConfig()
     }
+    void loadWalletBalance()
     await syncCartStockSnapshots()
-    debouncedLoadPreview()
-    loadWalletBalance()
+    // Stock snapshot updates trigger the regular debounce watcher. The initial
+    // preview should run immediately instead of paying that typing debounce.
+    debouncedLoadPreview.cancel()
+    await loadPreview()
   })
 
   onUnmounted(() => {

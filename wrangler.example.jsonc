@@ -3,6 +3,9 @@
   "name": "dujiao-next-cloudflare",
   "main": "worker/index.ts",
   "compatibility_date": "2026-04-08",
+  "placement": {
+    "mode": "smart"
+  },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 0.1
@@ -13,7 +16,13 @@
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
-    "run_worker_first": true
+    "run_worker_first": [
+      "/api/*",
+      "/uploads/*",
+      "/health",
+      "/sitemap.xml",
+      "/robots.txt"
+    ]
   },
   "d1_databases": [
     {

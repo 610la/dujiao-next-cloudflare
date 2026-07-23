@@ -14,6 +14,7 @@ import { refreshCartStockSnapshots, cartItemPurchaseLimit as itemPurchaseLimit, 
 import { getImageUrl } from '../utils/image'
 import { getAffiliateCode, getAffiliateVisitorKey } from '../utils/affiliate'
 import { clearCheckoutRequestId, getOrCreateCheckoutRequestId } from '../utils/checkoutAttempt'
+import { saveCheckoutOrderSnapshot } from '../utils/checkoutOrderSnapshot'
 import ImageCaptcha from '../components/captcha/ImageCaptcha.vue'
 import TurnstileCaptcha from '../components/captcha/TurnstileCaptcha.vue'
 import { useLocalized, useProductLabels } from './useProduct'
@@ -941,6 +942,10 @@ export function useCheckout() {
 
       clearCheckoutRequestId(checkoutRequestId)
       clearSourceStore()
+
+      if (responseData.order) {
+        saveCheckoutOrderSnapshot(String(responseData.order_no), responseData.order)
+      }
 
       // Redirect to the existing Payment page which handles all payment display
       const payQuery = new URLSearchParams()

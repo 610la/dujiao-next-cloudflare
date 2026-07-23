@@ -13,17 +13,18 @@ const productDetailViewLoader: RouteComponentLoader = () => import('../views/Pro
 const cartViewLoader: RouteComponentLoader = () => import('../views/Cart.vue')
 const checkoutViewLoader: RouteComponentLoader = () => import('../views/Checkout.vue')
 const paymentViewLoader: RouteComponentLoader = () => import('../views/Payment.vue')
+const paymentRouteLoader: RouteComponentLoader = templateView('Payment', paymentViewLoader)
 const blogViewLoader: RouteComponentLoader = () => import('../views/Blog.vue')
 const noticeViewLoader: RouteComponentLoader = () => import('../views/Notice.vue')
 const loginViewLoader: RouteComponentLoader = () => import('../views/auth/Login.vue')
 const resellerLayoutLoader: RouteComponentLoader = () => import('../views/reseller/ResellerConsoleLayout.vue')
 
 const routeWarmupLoaders: RouteComponentLoader[] = [
+    paymentRouteLoader,
     productsViewLoader,
     productDetailViewLoader,
     cartViewLoader,
     checkoutViewLoader,
-    paymentViewLoader,
     blogViewLoader,
     noticeViewLoader,
     loginViewLoader,
@@ -154,7 +155,7 @@ const router = createRouter({
         {
             path: '/pay',
             name: 'payment',
-            component: templateView('Payment', paymentViewLoader),
+            component: paymentRouteLoader,
         },
         {
             path: '/me',

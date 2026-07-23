@@ -19,6 +19,7 @@ import {
 } from '../utils/paymentResumePolicy'
 import QRCode from 'qrcode'
 import { type PageAlert } from '../utils/alerts'
+import { consumeCheckoutOrderSnapshot } from '../utils/checkoutOrderSnapshot'
 
 /**
  * 支付页共享逻辑（classic + vault 双模板共用）。
@@ -670,7 +671,8 @@ export function usePayment() {
             cachedPayment.value = null
             return
           }
-          if (!paymentResult.value && !latestLoaded.value && order.value.status === 'pending_payment') {
+          if (!paymentResult.value && !latestLoaded.value && order.value.status === 'pending_payment'
+            && (!autoPayRequested.value || !routeChannelId.value)) {
             latestLoaded.value = true
             await loadLatestPayment()
           }
@@ -1052,7 +1054,7 @@ export function usePayment() {
         openedPayWindow.value = false
         startPolling()
         void captureCurrentPayment({ silent: true })
-        await loadWallet()
+        void loadWallet()
       }
       window.scrollTo({ top: 0, behavior: 'smooth' })
       if (shouldAutoOpenPaymentLink(paymentResult.value)) {
@@ -1264,7 +1266,17 @@ export function usePayment() {
     if (routeChannelId.value) {
       selectedChannelId.value = routeChannelId.value
     }
-    loadOrder()
+    const checkoutOrder = autoPayRequested.value
+      ? consumeCheckoutOrderSnapshot(orderNoQuery.value)
+      : null
+    if (checkoutOrder) {
+      order.value = checkoutOrder
+      latestLoaded.value = true
+      loading.value = false
+      void loadOrder({ silent: true })
+    } else {
+      void loadOrder()
+    }
     void loadWallet()
     if (!appStore.config || !Array.isArray(appStore.config?.payment_channels)) {
       appStore.loadConfig(true)
@@ -1363,7 +1375,7 @@ export function usePayment() {
       if (paymentResult.value?.pay_url || paymentResult.value?.qr_code) return
       if (showGuestAuthForm.value || !configReady.value || !canSubmitPayment.value) return
       autoPaymentStarted.value = true
-      void handlePayment()
+      void performPayment()
     },
     { immediate: true }
   )

@@ -865,6 +865,15 @@ const ADMIN_RECOVERY_CODE_COUNT = 10;
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const PROCUREMENT_CRON_BATCH_SIZE = 20;
 const DOWNSTREAM_CALLBACK_CRON_BATCH_SIZE = 20;
+const CACHEABLE_SETTING_KEYS = new Set([
+  "callback_routes_config",
+  "site_config",
+  "order_risk_control_config",
+  "wallet_config",
+  "order_config"
+]);
+const SETTING_CACHE_TTL_MS = 30_000;
+const settingCache = new Map<string, { raw: string | null; expiresAt: number }>();
 
 class ApiRequestError extends Error {
   constructor(readonly status: number, message: string) {
@@ -4838,10 +4847,12 @@ async function apiGuestCreateOrder(
   });
   if (!risk.ok) return risk.response;
   const resellerContext = await resolveResellerContextFromRequest(request, env);
-  const calc = await calculateOrder(env, body, resellerContext, user);
+  const [calc, walletSettings] = await Promise.all([
+    calculateOrder(env, body, resellerContext, user),
+    walletConfig(env)
+  ]);
   if (!calc.ok) return apiError(calc.error, 400);
 
-  const walletSettings = await walletConfig(env);
   let wallet: WalletRow | null = null;
   if (walletSettings.walletOnlyPayment) {
     if (!user) return apiError("站点当前仅支持登录会员使用钱包余额支付", 400);
@@ -5757,8 +5768,12 @@ async function createOrReturnOrderPayment(
   useBalance = false
 ): Promise<AnyRecord> {
   if (order.parent_id != null) throw new ApiRequestError(400, "子订单不能单独发起支付");
-  await cancelExpiredPendingOrders(env);
   order = await env.DB.prepare("SELECT * FROM orders WHERE id=?").bind(order.id).first<OrderRow>() || order;
+  const expiresAt = order.expires_at ? new Date(order.expires_at).getTime() : 0;
+  if (order.status === "pending_payment" && expiresAt > 0 && expiresAt <= Date.now()) {
+    await cancelExpiredPendingOrders(env);
+    order = await env.DB.prepare("SELECT * FROM orders WHERE id=?").bind(order.id).first<OrderRow>() || order;
+  }
   if (order.status !== "pending_payment") {
     return {
       order_paid: ["paid", "fulfilling", "partially_delivered", "delivered", "completed"].includes(order.status),
@@ -5817,7 +5832,7 @@ async function createOrReturnOrderPayment(
     const existingProviderType = clean(existing.provider_type, 40).toLowerCase();
     const missingPaymentTarget = !clean(existing.pay_url, 1000) && !clean(existing.qr_code, 2000);
     if (isImplementedPaymentProvider(existingProviderType, existing.channel_type) && missingPaymentTarget) {
-      const prepared = await prepareProviderOrderPayment(env, existing, order);
+      const prepared = await prepareProviderOrderPayment(env, existing, order, channel);
       if (!prepared.ok) {
         await failOrderPaymentCreation(env, existing, order, prepared.error);
         throw new ApiRequestError(400, prepared.error);
@@ -5833,13 +5848,14 @@ async function createOrReturnOrderPayment(
     userId: order.user_id || 0,
     guestEmail: order.guest_email || "",
     channelId,
+    channel,
     amount,
     status: "pending",
     paidAt: null
   });
-  const hydrated = payment ? await paymentByIdWithContext(env, payment.id) : null;
+  const hydrated = payment ? { ...payment, order_no: order.order_no, channel_name: channel.name } : null;
   if (hydrated && clean(hydrated.provider_type, 40).toLowerCase() !== "manual") {
-    const prepared = await prepareProviderOrderPayment(env, hydrated, order);
+    const prepared = await prepareProviderOrderPayment(env, hydrated, order, channel);
     if (!prepared.ok) {
       await failOrderPaymentCreation(env, hydrated, order, prepared.error);
       throw new ApiRequestError(400, prepared.error);
@@ -5988,7 +6004,12 @@ function isImplementedPaymentProvider(providerType: unknown, channelType?: unkno
   return IMPLEMENTED_PAYMENT_PROVIDERS.has(paymentProviderKey(providerType, channelType));
 }
 
-async function prepareProviderOrderPayment(env: Env, payment: PaymentRow, order: OrderRow): Promise<PreparedProviderPayment> {
+async function prepareProviderOrderPayment(
+  env: Env,
+  payment: PaymentRow,
+  order: OrderRow,
+  channel?: PaymentChannelRow
+): Promise<PreparedProviderPayment> {
   const siteUrl = await sitePublicUrl(env);
   return prepareProviderPaymentTarget(env, payment, {
     bizType: "order",
@@ -5997,7 +6018,7 @@ async function prepareProviderOrderPayment(env: Env, payment: PaymentRow, order:
     returnUrl: `${siteUrl}/pay?${order.user_id ? "" : "guest=1&"}order_no=${encodeURIComponent(order.order_no)}`,
     orderUserKey: order.user_id ? String(order.user_id) : (clean(order.guest_email, 255) || order.order_no),
     clientIp: clean(order.client_ip, 100)
-  });
+  }, channel);
 }
 
 async function prepareProviderRechargePayment(env: Env, payment: PaymentRow, recharge: WalletRechargeRow): Promise<PreparedProviderPayment> {
@@ -6016,12 +6037,13 @@ async function prepareProviderRechargePayment(env: Env, payment: PaymentRow, rec
 async function prepareProviderPaymentTarget(
   env: Env,
   payment: PaymentRow,
-  target: ProviderPaymentTarget
+  target: ProviderPaymentTarget,
+  channel?: PaymentChannelRow
 ): Promise<PreparedProviderPayment> {
   const providerType = clean(payment.provider_type, 40).toLowerCase();
   switch (paymentProviderKey(providerType, payment.channel_type)) {
     case "epay":
-      return prepareEpayPaymentTarget(env, payment, target);
+      return prepareEpayPaymentTarget(env, payment, target, channel);
     case "bepusdt":
       return prepareBepusdtPaymentTarget(env, payment, target);
     case "epusdt":
@@ -6048,9 +6070,10 @@ async function prepareProviderPaymentTarget(
 async function prepareEpayPaymentTarget(
   env: Env,
   payment: PaymentRow,
-  target: ProviderPaymentTarget
+  target: ProviderPaymentTarget,
+  paymentChannel?: PaymentChannelRow
 ): Promise<{ ok: true; payment: PaymentRow } | { ok: false; error: string }> {
-  const channel = await paymentChannelById(env, payment.channel_id);
+  const channel = paymentChannel || await paymentChannelById(env, payment.channel_id);
   const config = jsonObject(jsonParse(channel?.config_json || "{}", {}));
   const gateway = clean(config.gateway_url, 1000).replace(/\/+$/, "");
   const version = (clean(config.epay_version, 20) || "v1").toLowerCase();
@@ -6164,9 +6187,13 @@ function normalizeEpayPayType(value: unknown): string {
 }
 
 async function paymentCallbackUrl(env: Env): Promise<string> {
-  const routes = normalizeCallbackRoutesSetting(await setting(env, "callback_routes_config", {}));
+  const [routeSetting, publicUrl] = await Promise.all([
+    setting(env, "callback_routes_config", {}),
+    sitePublicUrl(env)
+  ]);
+  const routes = normalizeCallbackRoutesSetting(routeSetting);
   const path = clean(routes.payment_callback, 500) || CALLBACK_ROUTE_DEFAULTS.payment_callback;
-  return `${(await sitePublicUrl(env)).replace(/\/+$/, "")}${path}`;
+  return `${publicUrl.replace(/\/+$/, "")}${path}`;
 }
 
 function paymentReturnUrl(configured: unknown, target: ProviderPaymentTarget, marker: string): string {
@@ -6317,18 +6344,23 @@ async function persistPreparedProviderPayment(
   const providerPayload = { ...previous, ...result.payload };
   const amount = clean(result.amount, 80);
   const currency = clean(result.currency, 20).toUpperCase();
-  await env.DB.prepare(
+  const fresh = await env.DB.prepare(
     `UPDATE payments
      SET pay_url=?, qr_code=?, provider_ref=COALESCE(NULLIF(?, ''), provider_ref),
          provider_payload_json=?, amount=CASE WHEN ?<>'' THEN CAST(? AS REAL) ELSE amount END,
          currency=CASE WHEN ?<>'' THEN ? ELSE currency END, status='pending', updated_at=CURRENT_TIMESTAMP
-     WHERE id=?`
+     WHERE id=?
+     RETURNING *`
   ).bind(
     clean(result.payUrl, 4000), clean(result.qrCode, 10000), clean(result.providerRef, 200),
     stringify(providerPayload), amount, amount, currency, currency, payment.id
-  ).run();
-  const fresh = await paymentByIdWithContext(env, payment.id);
-  return { ok: true, payment: fresh || { ...payment, pay_url: result.payUrl, qr_code: result.qrCode } };
+  ).first<PaymentRow>();
+  return {
+    ok: true,
+    payment: fresh
+      ? { ...fresh, order_no: payment.order_no, channel_name: payment.channel_name }
+      : { ...payment, pay_url: result.payUrl, qr_code: result.qrCode, provider_ref: result.providerRef }
+  };
 }
 
 function bepusdtTradeType(channelType: unknown): string {
@@ -18020,30 +18052,37 @@ async function hydrateOrder(
 ): Promise<AnyRecord> {
   const includeChildren = options.includeChildren !== false;
   const includeCost = options.includeCost === true;
-  const itemsResult = order.parent_id == null
-    ? await env.DB.prepare(
+  const itemsQuery = order.parent_id == null
+    ? env.DB.prepare(
       `SELECT oi.* FROM order_items oi
        JOIN orders item_order ON item_order.id=oi.order_id
        WHERE item_order.id=? OR item_order.parent_id=?
        ORDER BY item_order.id ASC, oi.id ASC`
     ).bind(order.id, order.id).all<OrderItemRow>()
-    : await env.DB.prepare("SELECT * FROM order_items WHERE order_id=? ORDER BY id ASC").bind(order.id).all<OrderItemRow>();
-  const fulfillment = await env.DB.prepare("SELECT * FROM fulfillments WHERE order_id=?").bind(order.id).first<FulfillmentRow>();
-  const paymentsResult = await env.DB.prepare(
+    : env.DB.prepare("SELECT * FROM order_items WHERE order_id=? ORDER BY id ASC").bind(order.id).all<OrderItemRow>();
+  const fulfillmentQuery = env.DB.prepare("SELECT * FROM fulfillments WHERE order_id=?").bind(order.id).first<FulfillmentRow>();
+  const paymentsQuery = env.DB.prepare(
     `SELECT p.*, pc.name AS channel_name
      FROM payments p LEFT JOIN payment_channels pc ON pc.id=p.channel_id
      WHERE p.order_id=?
      ORDER BY p.id DESC`
   ).bind(order.id).all<PaymentRow>();
+  const [itemsResult, fulfillment, paymentsResult] = await Promise.all([
+    itemsQuery,
+    fulfillmentQuery,
+    paymentsQuery
+  ]);
   const storedItems = itemsResult.results || [];
   const items = storedItems.map((item) => formatOrderItem(item, includeCost));
-  const products = await productRowsByIds(env, storedItems.map((item) => Number(item.product_id || 0)));
-  const allowedPaymentChannelIds = productPaymentChannelIntersection(products);
   const payments = (paymentsResult.results || []).map(formatPayment);
   const formattedFulfillment = fulfillment ? formatFulfillment(fulfillment) : null;
-  const children = includeChildren && order.parent_id == null
-    ? await hydrateOrderChildren(env, order, items, formattedFulfillment, payments, includeCost)
-    : [];
+  const [products, children] = await Promise.all([
+    productRowsByIds(env, storedItems.map((item) => Number(item.product_id || 0))),
+    includeChildren && order.parent_id == null
+      ? hydrateOrderChildren(env, order, items, formattedFulfillment, payments, includeCost)
+      : Promise.resolve([])
+  ]);
+  const allowedPaymentChannelIds = productPaymentChannelIntersection(products);
   return {
     ...order,
     original_amount: Number(order.original_amount || 0),
@@ -19245,7 +19284,15 @@ async function refreshOrderFulfillmentStatus(env: Env, orderId: number): Promise
 }
 
 async function setting(env: Env, key: string, fallback: AnyRecord): Promise<AnyRecord> {
+  const cacheable = CACHEABLE_SETTING_KEYS.has(key);
+  const cached = cacheable ? settingCache.get(key) : undefined;
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.raw === null ? fallback : jsonParse(cached.raw, fallback);
+  }
   const row = await env.DB.prepare("SELECT value_json FROM settings WHERE key=?").bind(key).first<{ value_json: string }>();
+  if (cacheable) {
+    settingCache.set(key, { raw: row?.value_json ?? null, expiresAt: Date.now() + SETTING_CACHE_TTL_MS });
+  }
   return row ? jsonParse(row.value_json, fallback) : fallback;
 }
 
@@ -19258,6 +19305,7 @@ async function upsertSetting(env: Env, key: string, value: unknown): Promise<voi
   await env.DB.prepare(
     "INSERT INTO settings (key, value_json) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=CURRENT_TIMESTAMP"
   ).bind(key, JSON.stringify(value ?? {})).run();
+  settingCache.delete(key);
 }
 
 function sanitizeSettingValue(key: string, value: unknown): unknown {
@@ -21555,24 +21603,27 @@ async function validatePaymentChannelForOrder(
   order: OrderRow,
   amount: number
 ): Promise<string> {
-  if ((await walletConfig(env)).walletOnlyPayment) return "站点当前仅支持钱包余额支付";
+  const [wallet, user, productRows] = await Promise.all([
+    walletConfig(env),
+    order.user_id ? getUserById(env, order.user_id) : Promise.resolve(null),
+    env.DB.prepare(
+      `SELECT DISTINCT p.*
+       FROM order_items oi
+       JOIN orders item_order ON item_order.id=oi.order_id
+       JOIN products p ON p.id=oi.product_id
+       WHERE item_order.id=? OR item_order.parent_id=?`
+    ).bind(order.id, order.id).all<ProductRow>()
+  ]);
+  if (wallet.walletOnlyPayment) return "站点当前仅支持钱包余额支付";
   if (!channel.is_active) return "支付渠道已停用";
   const providerType = clean(channel.provider_type, 40).toLowerCase();
   if (!["manual", "wallet"].includes(providerType) && !isImplementedPaymentProvider(providerType, channel.channel_type)) {
     return "该支付服务尚未接入 Cloudflare 运行时";
   }
   if (!paymentChannelAcceptsAmount(channel, amount)) return "订单金额不符合支付渠道限额";
-  const user = order.user_id ? await getUserById(env, order.user_id) : null;
   if (!paymentChannelAllowsRole(channel, user)) return "当前账号类型不能使用该支付渠道";
   if (!paymentChannelAllowsMemberLevel(channel, user)) return "当前会员等级不能使用该支付渠道";
   if (!paymentChannelAllowsType(channel, "order")) return "该支付渠道不支持订单支付";
-  const productRows = await env.DB.prepare(
-    `SELECT DISTINCT p.*
-     FROM order_items oi
-     JOIN orders item_order ON item_order.id=oi.order_id
-     JOIN products p ON p.id=oi.product_id
-     WHERE item_order.id=? OR item_order.parent_id=?`
-  ).bind(order.id, order.id).all<ProductRow>();
   const allowedIds = productPaymentChannelIntersection(productRows.results || []);
   if (allowedIds !== null && !allowedIds.includes(channel.id)) return "订单商品不支持该支付渠道";
   return "";
@@ -21586,13 +21637,14 @@ async function createManualPaymentForOrder(
     userId: number;
     guestEmail: string;
     channelId: number;
+    channel?: PaymentChannelRow;
     amount: number;
     paidAt?: string | null;
     status?: string;
     providerPayload?: AnyRecord;
   }
 ): Promise<PaymentRow | null> {
-  const channel = await paymentChannelById(env, input.channelId);
+  const channel = input.channel || await paymentChannelById(env, input.channelId);
   const feeRate = Number(channel?.fee_rate || 0);
   const fixedFee = Number(channel?.fixed_fee || 0);
   const amount = centsToMoney(moneyToCents(input.amount));
@@ -21600,12 +21652,13 @@ async function createManualPaymentForOrder(
   const payable = centsToMoney(moneyToCents(amount) + moneyToCents(feeAmount));
   const paymentNo = makePaymentNo();
   const status = clean(input.status, 30) || (input.paidAt ? "success" : "pending");
-  const result = await env.DB.prepare(
+  return env.DB.prepare(
     `INSERT INTO payments (
       payment_no, order_id, user_id, guest_email, channel_id, provider_type, channel_type,
       interaction_mode, amount, payable_amount, fee_rate, fixed_fee, fee_amount, currency,
       status, provider_payload_json, paid_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CNY', ?, ?, ?)`
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CNY', ?, ?, ?)
+    RETURNING *`
   ).bind(
     paymentNo,
     input.orderId,
@@ -21623,10 +21676,7 @@ async function createManualPaymentForOrder(
     status,
     stringify(input.providerPayload || { order_no: input.orderNo, mode: channel?.provider_type || "manual" }),
     input.paidAt || null
-  ).run();
-  return env.DB.prepare("SELECT * FROM payments WHERE id=?")
-    .bind(Number(result.meta.last_row_id))
-    .first<PaymentRow>();
+  ).first<PaymentRow>();
 }
 
 function buildPaymentsWhere(url: URL): { where: string; params: unknown[] } {

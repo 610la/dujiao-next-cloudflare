@@ -897,7 +897,7 @@ export function useCheckout() {
         ...buildOrderPayload(),
         channel_id: requiresOnlineChannel.value ? (selectedChannelId.value || undefined) : undefined,
         use_balance: useBalance.value,
-        defer_payment: true,
+        compact_response: true,
       }
       const checkoutRequestId = await getOrCreateCheckoutRequestId({
         buyer: userAuthStore.isAuthenticated
@@ -941,6 +941,18 @@ export function useCheckout() {
 
       clearCheckoutRequestId(checkoutRequestId)
       clearSourceStore()
+
+      const interactionMode = String(responseData.interaction_mode || '').trim().toLowerCase()
+      const providerPayUrl = String(responseData.pay_url || '').trim()
+      if (requiresOnlineChannel.value && interactionMode === 'redirect' && providerPayUrl) {
+        try {
+          const target = new URL(providerPayUrl, window.location.origin)
+          if (target.protocol === 'http:' || target.protocol === 'https:') {
+            window.location.assign(target.toString())
+            return
+          }
+        } catch {}
+      }
 
       // Redirect to the existing Payment page which handles all payment display
       const payQuery = new URLSearchParams()

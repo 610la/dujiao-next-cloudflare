@@ -4750,7 +4750,7 @@ async function checkoutOrderBelongsToBuyer(
   return verifyGuestOrderAccess(order, email, guestPassword);
 }
 
-async function checkoutReplayResponse(env: Env, order: OrderRow, compact = false): Promise<Response> {
+async function checkoutReplayResponse(env: Env, order: OrderRow): Promise<Response> {
   const payment = await latestPaymentForOrder(env, order.id);
   const paymentData = payment
     ? formatPaymentCreateResult(payment, order)
@@ -4764,7 +4764,7 @@ async function checkoutReplayResponse(env: Env, order: OrderRow, compact = false
       };
   return apiOk({
     ...paymentData,
-    ...(compact ? {} : { order: await hydrateOrder(env, order) }),
+    order: await hydrateOrder(env, order),
     order_no: order.order_no,
     order_status: order.status,
     status: order.status,
@@ -4806,7 +4806,6 @@ async function apiGuestCreateOrder(
 ): Promise<Response> {
   const body = await readJson(request);
   const createAndPay = new URL(request.url).pathname.endsWith("/create-and-pay");
-  const compactResponse = createAndPay && body.compact_response === true;
   const email = user?.email || normalizeEmail(body.email || body.guest_email);
   if (!email) return apiError("邮箱格式不正确", 400);
   const guestPassword = user ? "" : String(body.order_password || body.password || "");
@@ -4823,7 +4822,7 @@ async function apiGuestCreateOrder(
       if (!await checkoutOrderBelongsToBuyer(existingOrder, user, email, guestPassword)) {
         return apiError("结算请求标识冲突", 409);
       }
-      return checkoutReplayResponse(env, existingOrder, compactResponse);
+      return checkoutReplayResponse(env, existingOrder);
     }
   }
   if (!user) {
@@ -4925,7 +4924,7 @@ async function apiGuestCreateOrder(
       if (checkoutRequestId && /unique constraint failed.*orders\.checkout_request_id/i.test(message)) {
         const racedOrder = await checkoutOrderByRequestId(env, checkoutRequestId);
         if (racedOrder && await checkoutOrderBelongsToBuyer(racedOrder, user, email, guestPassword)) {
-          return checkoutReplayResponse(env, racedOrder, compactResponse);
+          return checkoutReplayResponse(env, racedOrder);
         }
       }
       throw error;
@@ -5058,7 +5057,7 @@ async function apiGuestCreateOrder(
   if (requiresOnlinePayment && (!createAndPay || requestedChannelId <= 0 || deferProviderPayment)) {
     const pendingOrder = await env.DB.prepare("SELECT * FROM orders WHERE id=?").bind(orderId).first<OrderRow>();
     return apiOk({
-      ...(compactResponse ? {} : { order: pendingOrder ? await hydrateOrder(env, pendingOrder) : null }),
+      order: pendingOrder ? await hydrateOrder(env, pendingOrder) : null,
       order_no: orderNo,
       order_status: "pending_payment",
       status: "pending_payment",
@@ -5083,7 +5082,7 @@ async function apiGuestCreateOrder(
     }
     const refreshedOrder = await env.DB.prepare("SELECT * FROM orders WHERE id=?").bind(orderId).first<OrderRow>();
     return apiOk({
-      ...(compactResponse ? {} : { order: refreshedOrder ? await hydrateOrder(env, refreshedOrder) : null }),
+      order: refreshedOrder ? await hydrateOrder(env, refreshedOrder) : null,
       order_no: orderNo,
       order_status: "pending_payment",
       status: "pending_payment",

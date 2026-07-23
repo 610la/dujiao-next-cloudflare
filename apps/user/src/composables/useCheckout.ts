@@ -75,6 +75,7 @@ export function useCheckout() {
   const syncingStock = ref(false)
   const orderPaymentChannels = ref<any[]>([])
   const orderPaymentChannelsRequestId = ref(0)
+  const orderPaymentChannelsResolved = ref(false)
 
   // Payment state
   const selectedChannelId = ref<number | null>(null)
@@ -84,9 +85,17 @@ export function useCheckout() {
 
   // Payment channels
   const paymentChannels = computed(() => {
+    const previewChannels = Array.isArray(preview.value?.payment_channels)
+      ? preview.value.payment_channels
+      : null
+    const configChannels = Array.isArray(appStore.config?.payment_channels)
+      ? appStore.config.payment_channels
+      : []
     const list = userAuthStore.isAuthenticated
-      ? orderPaymentChannels.value
-      : (preview.value?.payment_channels || appStore.config?.payment_channels)
+      ? (orderPaymentChannelsResolved.value
+          ? orderPaymentChannels.value
+          : (previewChannels || configChannels))
+      : (previewChannels || configChannels)
     if (!Array.isArray(list)) return []
     let filtered = list.filter((channel: any) => {
       const providerType = String(channel?.provider_type || '').toLowerCase()
@@ -691,17 +700,44 @@ export function useCheckout() {
 
   const loadOrderPaymentChannels = async () => {
     if (!userAuthStore.isAuthenticated) {
+      orderPaymentChannelsRequestId.value += 1
       orderPaymentChannels.value = []
+      orderPaymentChannelsResolved.value = false
       return
     }
     if (!requiresOnlineChannel.value) {
+      orderPaymentChannelsRequestId.value += 1
       orderPaymentChannels.value = []
+      orderPaymentChannelsResolved.value = true
       return
     }
     if (cartItems.value.length === 0 || !preview.value) {
+      orderPaymentChannelsRequestId.value += 1
       orderPaymentChannels.value = []
+      orderPaymentChannelsResolved.value = false
       return
     }
+
+    const previewChannels = Array.isArray(preview.value?.payment_channels)
+      ? preview.value.payment_channels
+      : []
+    const previewTotalCents = amountToCents(preview.value?.total_amount)
+    const walletChangesOnlineAmount = useBalance.value
+      && expectedWalletPaidCents.value > 0
+      && previewTotalCents !== null
+      && expectedOnlinePayCents.value < previewTotalCents
+
+    // The preview already applies user, product and amount restrictions. Only
+    // query again when wallet credit changes the amount sent to the provider.
+    if (!walletChangesOnlineAmount) {
+      orderPaymentChannelsRequestId.value += 1
+      orderPaymentChannels.value = previewChannels
+      orderPaymentChannelsResolved.value = true
+      return
+    }
+
+    orderPaymentChannels.value = previewChannels
+    orderPaymentChannelsResolved.value = false
     const requestId = ++orderPaymentChannelsRequestId.value
     try {
       const response = await userOrderAPI.getPaymentChannels({
@@ -711,10 +747,11 @@ export function useCheckout() {
       if (requestId !== orderPaymentChannelsRequestId.value) return
       const channels = response.data.data
       orderPaymentChannels.value = Array.isArray(channels) ? channels : []
+      orderPaymentChannelsResolved.value = true
     } catch {
       if (requestId !== orderPaymentChannelsRequestId.value) return
-      const fallback = preview.value?.payment_channels
-      orderPaymentChannels.value = Array.isArray(fallback) ? fallback : []
+      orderPaymentChannels.value = previewChannels
+      orderPaymentChannelsResolved.value = true
     }
   }
 
@@ -735,6 +772,7 @@ export function useCheckout() {
     if (syncingStock.value) {
       preview.value = null
       orderPaymentChannels.value = []
+      orderPaymentChannelsResolved.value = false
       previewError.value = ''
       couponRefreshing.value = false
       return
@@ -742,6 +780,7 @@ export function useCheckout() {
     if (cartItems.value.length === 0) {
       preview.value = null
       orderPaymentChannels.value = []
+      orderPaymentChannelsResolved.value = false
       previewError.value = ''
       couponRefreshing.value = false
       return
@@ -749,6 +788,7 @@ export function useCheckout() {
     if (isGuestCheckout.value && (!guestEmail.value.trim() || !guestPassword.value.trim() || !guestEmailValid.value)) {
       preview.value = null
       orderPaymentChannels.value = []
+      orderPaymentChannelsResolved.value = false
       previewError.value = ''
       couponRefreshing.value = false
       return
@@ -757,6 +797,7 @@ export function useCheckout() {
     if (cartItems.value.some((item) => itemStockExceeded(item))) {
       preview.value = null
       orderPaymentChannels.value = []
+      orderPaymentChannelsResolved.value = false
       previewError.value = ''
       couponRefreshing.value = false
       return
@@ -764,6 +805,7 @@ export function useCheckout() {
     if (cartItems.value.some((item) => itemMinNotMet(item))) {
       preview.value = null
       orderPaymentChannels.value = []
+      orderPaymentChannelsResolved.value = false
       previewError.value = ''
       couponRefreshing.value = false
       return
@@ -790,14 +832,19 @@ export function useCheckout() {
       if (requestId !== previewRequestId.value) return
       preview.value = response.data.data
       if (userAuthStore.isAuthenticated) {
+        const channels = preview.value?.payment_channels
+        orderPaymentChannels.value = Array.isArray(channels) ? channels : []
+        orderPaymentChannelsResolved.value = false
         debouncedLoadOrderPaymentChannels()
       } else {
         orderPaymentChannels.value = []
+        orderPaymentChannelsResolved.value = false
       }
     } catch (err: any) {
       if (requestId !== previewRequestId.value) return
       preview.value = null
       orderPaymentChannels.value = []
+      orderPaymentChannelsResolved.value = false
       previewError.value = err.message || t('checkout.previewFailed')
     } finally {
       if (requestId === previewRequestId.value) {

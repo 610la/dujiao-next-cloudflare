@@ -4237,26 +4237,63 @@ async function apiAdminDeleteApiCredential(env: Env, id: number): Promise<Respon
 
 async function apiPublicConfig(request: Request, env: Env): Promise<Response> {
   const resellerContext = await resolveResellerContextFromRequest(request, env);
-  let value = cloneJsonRecord(await setting(env, "site_config", {}));
+  const publicSettingKeys = [
+    "site_config",
+    "registration_config",
+    "captcha",
+    "telegram_auth",
+    "home_announcement",
+    "wallet_config"
+  ];
+  const [settingsResult, channelsResult] = await env.DB.batch([
+    env.DB.prepare(
+      `SELECT key, value_json FROM settings WHERE key IN (${publicSettingKeys.map(() => "?").join(",")})`
+    ).bind(...publicSettingKeys),
+    env.DB.prepare("SELECT * FROM payment_channels WHERE is_active=1 ORDER BY sort_order ASC, id ASC")
+  ]);
+  const publicSettings = new Map(
+    ((settingsResult.results || []) as Array<{ key: string; value_json: string }>)
+      .map((row) => [row.key, row.value_json] as const)
+  );
+  const readPublicSetting = <T>(key: string, fallback: T): T => {
+    const raw = publicSettings.get(key);
+    return raw === undefined ? fallback : jsonParse(raw, fallback);
+  };
+
+  let value = cloneJsonRecord(readPublicSetting("site_config", {}));
   normalizePublicSiteName(value);
   if (resellerContext) value = applyResellerPublicConfig(value, resellerContext);
-  const registration = await registrationSettings(env);
+  const registrationRaw = jsonObject(readPublicSetting("registration_config", {}));
+  const registration = {
+    registration_enabled: registrationRaw.registration_enabled !== false,
+    email_verification_enabled: registrationRaw.email_verification_enabled !== false,
+    email_domain_allowlist_enabled: registrationRaw.email_domain_allowlist_enabled === true,
+    allowed_email_domains: normalizeEmailDomainList(registrationRaw.allowed_email_domains)
+  };
   value.registration_enabled = registration.registration_enabled !== false;
   value.email_verification_enabled = registration.email_verification_enabled !== false;
   value.email_domain_allowlist_enabled = registration.email_domain_allowlist_enabled === true;
   value.allowed_email_domains = normalizeEmailDomainList(registration.allowed_email_domains);
-  value.captcha = publicCaptchaSettings(await captchaSettings(env));
-  value.telegram_auth = publicTelegramAuthSettings(await telegramAuthSettings(env));
+  value.captcha = publicCaptchaSettings(normalizeCaptchaSettings(
+    readPublicSetting("captcha", defaultCaptchaSettings()),
+    defaultCaptchaSettings()
+  ));
+  value.telegram_auth = publicTelegramAuthSettings(normalizeTelegramAuthSettings(
+    readPublicSetting("telegram_auth", defaultTelegramAuthSettings())
+  ));
   const resellerAnnouncement = resellerContext
     ? normalizePublicHomeAnnouncement(jsonParse(resellerContext.siteConfig.announcement_json || "{}", {}), Date.now())
     : null;
-  const homeAnnouncement = resellerAnnouncement || normalizePublicHomeAnnouncement(await setting(env, "home_announcement", {}), Date.now());
+  const homeAnnouncement = resellerAnnouncement || normalizePublicHomeAnnouncement(
+    readPublicSetting("home_announcement", {}),
+    Date.now()
+  );
   if (homeAnnouncement) value.announcement = homeAnnouncement;
-  const channels = await activePaymentChannels(env);
+  const channels = (channelsResult.results || []) as PaymentChannelRow[];
   value.payment_channels = channels.map(formatPublicPaymentChannel);
-  const wallet = await walletConfig(env);
-  value.wallet_recharge_channel_ids = wallet.rechargeChannelIds;
-  value.wallet_only_payment = wallet.walletOnlyPayment;
+  const wallet = jsonObject(readPublicSetting("wallet_config", {}));
+  value.wallet_recharge_channel_ids = arrayNumbers(wallet.recharge_channel_ids);
+  value.wallet_only_payment = wallet.wallet_only_payment === true;
   value.server_time = Date.now();
   return apiOk(value);
 }

@@ -897,6 +897,7 @@ export function useCheckout() {
         ...buildOrderPayload(),
         channel_id: requiresOnlineChannel.value ? (selectedChannelId.value || undefined) : undefined,
         use_balance: useBalance.value,
+        defer_payment: true,
       }
       const checkoutRequestId = await getOrCreateCheckoutRequestId({
         buyer: userAuthStore.isAuthenticated
@@ -951,6 +952,9 @@ export function useCheckout() {
       if (requiresOnlineChannel.value && paymentChannelId) {
         payQuery.set('channel_id', String(paymentChannelId))
         payQuery.set('auto_pay', '1')
+      }
+      if (useBalance.value) {
+        payQuery.set('use_balance', '1')
       }
       router.push(`/pay?${payQuery.toString()}`)
     } catch (err: any) {

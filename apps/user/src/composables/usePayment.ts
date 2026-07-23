@@ -101,6 +101,10 @@ export function usePayment() {
   }
 
   const autoPayRequested = computed(() => readRouteQueryFlag('auto_pay'))
+  const routeUsesBalance = computed(() => readRouteQueryFlag('use_balance'))
+  watch(routeUsesBalance, (enabled) => {
+    if (enabled) useBalance.value = true
+  }, { immediate: true })
   const routeChannelId = computed(() => {
     const channelId = Number(readRouteQueryValue('channel_id'))
     return Number.isFinite(channelId) && channelId > 0 ? channelId : null

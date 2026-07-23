@@ -2598,8 +2598,8 @@ function validatePaymentChannelConfiguration(input: {
       requireUrl("gateway_url", "易支付网关地址");
       if (!clean(config.merchant_id || config.pid, 200)) throw new ApiRequestError(400, "易支付商户 ID 不能为空");
       if (!normalizeEpayPayType(input.channelType)) throw new ApiRequestError(400, "易支付渠道类型不受支持");
-      requireUrl("notify_url", "易支付异步通知地址");
-      requireUrl("return_url", "易支付同步回跳地址");
+      requireUrl("notify_url", "易支付异步通知地址", true);
+      requireUrl("return_url", "易支付同步回跳地址", true);
       const version = (clean(config.epay_version, 20) || "v1").toLowerCase();
       if (!["v1", "v2"].includes(version)) throw new ApiRequestError(400, "易支付版本必须是 v1 或 v2");
       if (version === "v2") {
@@ -5053,7 +5053,8 @@ async function apiGuestCreateOrder(
   }
 
   const requestedChannelId = toInt(body.channel_id, 0);
-  if (requiresOnlinePayment && (!createAndPay || requestedChannelId <= 0)) {
+  const deferProviderPayment = createAndPay && body.defer_payment === true;
+  if (requiresOnlinePayment && (!createAndPay || requestedChannelId <= 0 || deferProviderPayment)) {
     const pendingOrder = await env.DB.prepare("SELECT * FROM orders WHERE id=?").bind(orderId).first<OrderRow>();
     return apiOk({
       order: pendingOrder ? await hydrateOrder(env, pendingOrder) : null,
@@ -5062,6 +5063,7 @@ async function apiGuestCreateOrder(
       status: "pending_payment",
       wallet_paid_amount: money(walletPaidAmount),
       online_paid_amount: money(onlinePaidAmount),
+      channel_id: requestedChannelId > 0 ? requestedChannelId : null,
       message: "订单已创建，请选择支付方式"
     });
   }
